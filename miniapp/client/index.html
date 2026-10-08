@@ -187,6 +187,7 @@ td .sub { display: block; font-size: 11px; color: var(--mcode-text-subtle); }
 .hit { color: var(--mcode-success); }
 .hit.mid { color: var(--mcode-warning); }
 .hit.low { color: var(--mcode-danger); }
+.rate-warn { color: var(--mcode-warning); }
 
 /* footer + toast */
 .page-foot { font-size: 12px; color: var(--mcode-text-subtle); line-height: 1.7; margin-top: 4px; }
@@ -367,7 +368,7 @@ td .sub { display: block; font-size: 11px; color: var(--mcode-text-subtle); }
   </section>
 
   <footer class="page-foot" id="page-foot">
-    口径：总 tokens = 输入 + 输出 + 推理 + 缓存读 + 缓存写；命中率 = 缓存读 / (缓存读 + 输入)；输出速率 = 单次成功调用的 输出 tokens ÷ decode 时长（首 token 到流结束）的算术平均，历史快照表为归档口径（输出 ÷ 会话起止时长）。数据来自本机 runtime 用量记录（sqlite + 日志按 turn 补全 + config.yaml 显示名），只读。
+    口径：总 tokens = 输入 + 输出 + 推理 + 缓存读 + 缓存写；命中率 = 缓存读 / (缓存读 + 输入)；输出速率 = 单次成功调用的 输出 tokens ÷ decode 时长（首 token 到流结束）的算术平均，decode 计时异常的调用（超过 Q3+3×IQR 上界）剔除出均值但在调用日志中以 ⚠ 标注；历史快照表为归档口径（输出 ÷ 会话起止时长）。数据来自本机 runtime 用量记录（sqlite + 日志按 turn 补全 + config.yaml 显示名），只读。
   </footer>
 </div>
 <div class="toast" id="toast" role="status"></div>
@@ -678,7 +679,10 @@ function renderTrend(d) {
   $('kpi-calls-sub').textContent = d.series.totalTokens.length ? '峰值 ' + compact(Math.max.apply(null, d.series.totalTokens.concat([0]))) + ' / 桶' : '';
   $('kpi-hit').textContent = pct(d.kpis.cacheHitRate);
   $('kpi-rate').textContent = rateFmt(d.kpis.outputRate);
-  $('kpi-rate-sub').textContent = 'decode 均值 · ' + fmt.format(d.kpis.rateMeasured || 0) + '/' + fmt.format(d.kpis.calls) + ' 次可测';
+  $('kpi-rate-sub').textContent = 'decode 均值 · ' + fmt.format(d.kpis.rateMeasured || 0) + '/' + fmt.format(d.kpis.calls) + ' 可测' +
+    (d.kpis.rateOutliers ? ' · 剔' + d.kpis.rateOutliers + '异常' : '');
+  $('kpi-rate-sub').title = 'decode 时长（首 token 到流结束）速率算术平均；' + fmt.format(d.kpis.rateMeasured || 0) + '/' + fmt.format(d.kpis.calls) + ' 次可测' +
+    (d.kpis.rateOutliers ? '，剔除 ' + d.kpis.rateOutliers + ' 次计时异常（>Q3+3×IQR）' : '');
   $('kpi-models').textContent = d.kpis.activeModels;
   $('kpi-models-sub').textContent = d.models.map(function (m) { return m.modelName; }).join(' · ');
 
@@ -689,7 +693,7 @@ function renderTrend(d) {
   $('trend-foot').textContent =
     '来源：本机 runtime 用量记录（sqlite + 日志补全）' +
     (d.unknownRows > 0 ? ' · ' + d.unknownRows + ' 条未识别模型（早于日志保留期）' : '') +
-    ' · 命中率 = cacheRead / (cacheRead + input) · 速率 = 桶内成功调用的 decode 速率均值，无调用的桶不绘制';
+    ' · 命中率 = cacheRead / (cacheRead + input) · 速率 = 桶内成功调用的 decode 速率均值（剔除计时异常），无调用的桶不绘制';
 
   rebuildChart(d);
 }
@@ -759,9 +763,16 @@ function renderCalls(d) {
     tr.appendChild(tdNum(c.cacheReadTokens));
     tr.appendChild(tdNum(c.cacheWriteTokens));
     var rateCell = tdRate(c.outputRate);
-    rateCell.title = c.decodeMs != null
-      ? 'decode ' + fmt.format(c.decodeMs) + 'ms' + (c.requestMs != null ? ' · 请求全程 ' + fmt.format(c.requestMs) + 'ms' : '') + (c.finishReason ? ' · ' + c.finishReason : '')
-      : '该调用无 decode 计时（老数据），不参与速率均值';
+    if (c.rateOutlier) {
+      rateCell.classList.add('rate-warn');
+      rateCell.appendChild(el('span', null, ' ⚠'));
+      rateCell.title = 'decode 计时异常（疑似续传/重试只记录末段），未计入速率均值 · 原始值 ' + rateFmt(c.outputRate) + ' tok/s' +
+        (c.decodeMs != null ? ' · decode ' + fmt.format(c.decodeMs) + 'ms' : '') + (c.requestMs != null ? ' · 请求全程 ' + fmt.format(c.requestMs) + 'ms' : '');
+    } else {
+      rateCell.title = c.decodeMs != null
+        ? 'decode ' + fmt.format(c.decodeMs) + 'ms' + (c.requestMs != null ? ' · 请求全程 ' + fmt.format(c.requestMs) + 'ms' : '') + (c.finishReason ? ' · ' + c.finishReason : '')
+        : '该调用无 decode 计时（老数据），不参与速率均值';
+    }
     tr.appendChild(rateCell);
     var dec = el('td', null, c.decodeMs != null ? (c.decodeMs / 1000).toFixed(1) + 's' : '--');
     tr.appendChild(dec);
@@ -929,7 +940,7 @@ async function refreshHealth() {
       return;
     }
     $('page-foot').textContent =
-      '口径：总 tokens = 输入 + 输出 + 推理 + 缓存读 + 缓存写；命中率 = 缓存读 / (缓存读 + 输入)；输出速率 = 单次成功调用的 输出 tokens ÷ decode 时长（首 token 到流结束）的算术平均，历史快照表为归档口径（输出 ÷ 会话起止时长）。' +
+      '口径：总 tokens = 输入 + 输出 + 推理 + 缓存读 + 缓存写；命中率 = 缓存读 / (缓存读 + 输入)；输出速率 = 单次成功调用的 输出 tokens ÷ decode 时长（首 token 到流结束）的算术平均，decode 计时异常（>Q3+3×IQR）剔除出均值并在调用日志标注 ⚠；历史快照表为归档口径（输出 ÷ 会话起止时长）。' +
       '数据源：runtime sqlite（' + fmt.format(h.usageRows == null ? 0 : h.usageRows) + ' 行，只读）· Node ' + h.runtime.node +
       (h.runtime.queryMode === 'child' ? ' · 子进程查询' : '') + '。';
   } catch (e) {

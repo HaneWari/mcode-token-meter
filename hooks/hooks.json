@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${PLUGIN_ROOT}/scripts/session-snapshot.mjs\"",
+            "commandWindows": "node \"${PLUGIN_ROOT}\\scripts\\session-snapshot.mjs\"",
+            "timeout": 3
+          }
+        ]
+      }
+    ]
+  }
+}

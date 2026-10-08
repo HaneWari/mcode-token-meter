@@ -485,15 +485,57 @@ export function buildCallLedger(rows, enrichment, assistantByTurn, catalog) {
 }
 
 export function buildLedgerWithDb(db, rows, enrichment, catalog) {
-  return buildCallLedger(rows, enrichment, loadAssistantCallDetails(db, rows), catalog);
+  const ledger = buildCallLedger(rows, enrichment, loadAssistantCallDetails(db, rows), catalog);
+  markRateOutliers(ledger);
+  return ledger;
 }
 
-// Mean of per-call decode rates over the calls that have one.
+// --- decode-timing anomaly handling ------------------------------------------
+//
+// decode_duration_ms occasionally records only the final segment of a resumed
+// or retried stream, producing physically implausible rates (thousands of
+// tok/s). Rather than a hardcoded cap, mark per-call rate outliers with a
+// data-driven upper fence (Q3 + 3*IQR over the window's rated calls, active
+// only with 8+ samples) plus one hard physical rule: decode time can never
+// exceed the whole request duration. Outliers stay visible in the call log
+// but are excluded from every average.
+
+export function markRateOutliers(ledger) {
+  const rated = [];
+  for (const c of ledger) {
+    if (typeof c.rate === 'number') rated.push(c.rate);
+  }
+  let fence = Infinity;
+  if (rated.length >= 8) {
+    rated.sort((a, b) => a - b);
+    const q = (p) => rated[Math.min(rated.length - 1, Math.floor(rated.length * p))];
+    const q3 = q(0.75);
+    fence = q3 + 3 * (q3 - q(0.25));
+  }
+  let outliers = 0;
+  for (const c of ledger) {
+    c.rateOutlier = false;
+    if (typeof c.rate !== 'number') continue;
+    if ((c.decodeMs != null && c.requestMs != null && c.decodeMs > c.requestMs) || c.rate > fence) {
+      c.rateOutlier = true;
+      outliers += 1;
+    }
+  }
+  return outliers;
+}
+
+export function countRateOutliers(calls) {
+  let n = 0;
+  for (const c of calls) if (c.rateOutlier) n += 1;
+  return n;
+}
+
+// Mean of per-call decode rates over measured, non-outlier calls.
 export function meanCallRate(calls) {
   let sum = 0;
   let n = 0;
   for (const c of calls) {
-    if (typeof c.rate === 'number') {
+    if (typeof c.rate === 'number' && !c.rateOutlier) {
       sum += c.rate;
       n += 1;
     }
@@ -503,6 +545,6 @@ export function meanCallRate(calls) {
 
 export function countRatedCalls(calls) {
   let n = 0;
-  for (const c of calls) if (typeof c.rate === 'number') n += 1;
+  for (const c of calls) if (typeof c.rate === 'number' && !c.rateOutlier) n += 1;
   return n;
 }

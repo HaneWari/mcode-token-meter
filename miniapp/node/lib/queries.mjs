@@ -15,6 +15,7 @@ import {
   buildLedgerWithDb,
   meanCallRate,
   countRatedCalls,
+  countRateOutliers,
   emptyMetrics,
   addRow,
   finalize,
@@ -28,7 +29,7 @@ import { resolveTrendWindow, buildTrendFromContext } from './trend.mjs';
 export const NOTES = [
   'cacheHitRate = cacheReadTokens / (cacheReadTokens + inputTokens)，表示提示词中命中缓存的比例；cacheWriteTokens 不计入分母。',
   'totalTokens = input + output + reasoning + cacheRead + cacheWrite。',
-  'token 输出速率（token/s）= 单次成功调用（状态 200）的 输出 tokens ÷ decode 时长（首 token 到流结束），再取范围内所有可测调用的平均值；无 decode 记录的历史调用不参与平均。',
+  'token 输出速率（token/s）= 单次成功调用（状态 200）的 输出 tokens ÷ decode 时长（首 token 到流结束），再取范围内可测调用的算术平均；decode 计时异常的调用（超过 Q3+3×IQR 上界或 decode 大于请求全程，多为续传/重试只记了末段）在均值中剔除但在调用日志保留并标注；无 decode 记录的历史调用不参与平均。',
   'costUsd 为 runtime 记录值；自定义套餐/订阅类提供商通常为 0，不代表实际账单。',
   'model 字段由 runtime 日志 llm_response_identifiers 按 turn 补全（按小时文件名覆盖整个窗口）；仍为 unknown 的记录早于日志保留期。',
   '统计范围限于本机 runtime 数据库当前保留的数据；更早的历史见快照（SessionEnd Hook 归档）。',
@@ -56,6 +57,7 @@ export function openContext(dataDir, startMs, endMs, now = Date.now()) {
     },
     rows: rows.length,
     rateMeasured: countRatedCalls(ledger),
+    rateOutliers: countRateOutliers(ledger),
     logFilesScanned: filesScanned,
     turnsEnriched: enrichment.size,
     generatedAt: new Date(now).toISOString(),
@@ -167,12 +169,14 @@ export function queryCalls({ dataDir, startAt, endAt, days, limit }, now = Date.
         status: c.status,
         finishReason: c.finishReason,
         outputRate: c.rate,
+        rateOutlier: Boolean(c.rateOutlier),
       }));
     return {
       window: ctx.meta.window,
       calls,
       totalCalls: ctx.ledger.length,
       rateMeasured: ctx.meta.rateMeasured,
+      rateOutliers: ctx.meta.rateOutliers,
       notes: NOTES,
       meta: ctx.meta,
     };
