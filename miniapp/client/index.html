@@ -164,6 +164,11 @@ select:focus-visible, input:focus-visible {
 
 .tag { font-size: 10px; border: 1px solid var(--mcode-accent); color: var(--mcode-accent); border-radius: 4px; padding: 0 4px; margin-left: 4px; }
 td.name .tag { display: inline-block; margin-left: 0; margin-top: 2px; }
+/* conversation status pills */
+.tag.ok { color: var(--mcode-success); border-color: var(--mcode-success); }
+.tag.warn { color: var(--mcode-warning); border-color: var(--mcode-warning); }
+.tag.live { color: var(--mcode-accent); border-color: var(--mcode-accent); }
+.turn-summary { margin-left: auto; padding-left: 14px; font-size: 12px; color: var(--mcode-text-subtle); white-space: nowrap; }
 .chart-wrap { position: relative; width: 100%; height: 300px; }
 .chart-state {
   position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
@@ -324,24 +329,24 @@ td .sub { display: block; font-size: 11px; color: var(--mcode-text-subtle); }
     <div class="sec-err" id="calls-err" role="alert"></div>
   </section>
 
-  <section class="card" aria-label="历史快照">
+  <section class="card" aria-label="对话明细">
     <div class="card-head">
-      <div class="card-title">历史快照（SessionEnd 归档）</div>
+      <div class="card-title">对话明细（每次提问）</div>
       <div class="card-tools">
-        <select id="snap-limit" aria-label="快照数量上限">
-          <option value="20" selected>最近 20 条</option><option value="50">最近 50 条</option><option value="100">最近 100 条</option>
+        <select id="turn-limit" aria-label="对话数量上限">
+          <option value="50" selected>最近 50 次</option><option value="100">最近 100 次</option><option value="200">最近 200 次</option>
         </select>
       </div>
     </div>
     <div class="table-wrap">
       <table>
         <thead><tr>
-          <th>结束时间</th><th class="name">会话</th><th>Agent</th><th>时长</th><th>调用</th><th>总 tokens</th><th>速率 (tok/s)</th><th>命中率</th><th class="name">模型</th>
+          <th>开始时间</th><th class="name">用户消息</th><th>状态</th><th>时长</th><th>调用</th><th>输出</th><th>总 tokens</th><th>速率 (tok/s)</th><th>命中率</th><th class="name">会话</th><th class="name">主要模型</th>
         </tr></thead>
-        <tbody id="snap-body"><tr class="empty-row"><td colspan="9">加载中…</td></tr></tbody>
+        <tbody id="turn-body"><tr class="empty-row"><td colspan="11">加载中…</td></tr></tbody>
       </table>
     </div>
-    <div class="sec-err" id="snap-err" role="alert"></div>
+    <div class="sec-err" id="turn-err" role="alert"></div>
   </section>
 
   <section class="card" aria-label="会话用量排行">
@@ -368,7 +373,7 @@ td .sub { display: block; font-size: 11px; color: var(--mcode-text-subtle); }
   </section>
 
   <footer class="page-foot" id="page-foot">
-    口径：总 tokens = 输入 + 输出 + 推理 + 缓存读 + 缓存写；命中率 = 缓存读 / (缓存读 + 输入)；输出速率 = 输出 tokens ÷ decode 时长（首 token 到流结束），与 MiniMax Code 界面显示完全一致，窗口内按耗时加权；调用日志另列请求全程速率（发起请求→流结束，含首字等待）；历史快照表为归档口径。数据来自本机 runtime 用量记录（sqlite + 日志按 turn 补全 + config.yaml 显示名），只读。
+    口径：总 tokens = 输入 + 输出 + 推理 + 缓存读 + 缓存写；命中率 = 缓存读 / (缓存读 + 输入)；输出速率 = 输出 tokens ÷ decode 时长（首 token 到流结束），与 MiniMax Code 界面显示完全一致，窗口内按耗时加权；调用日志另列请求全程速率（发起请求→流结束，含首字等待）；对话明细以一次提问（turn）为单位，用户发出消息后模型经若干次调用直至给出最终回答即为一次，实时读取、无需关闭会话，其时长为挂钟跨度、不参与速率计算。数据来自本机 runtime 用量记录（sqlite + 日志按 turn 补全 + config.yaml 显示名），只读。
   </footer>
 </div>
 <div class="toast" id="toast" role="status"></div>
@@ -847,33 +852,68 @@ function renderDaily(d) {
   }, '该范围内没有用量记录');
 }
 
-function renderSnapshots(d) {
-  sectionError('snap-err', null);
-  fillTable('snap-body', 9, d.snapshots, function (s) {
+var TURN_STATUS = {
+  completed: { text: '已完成', cls: 'ok' },
+  unfinished: { text: '未收尾', cls: 'warn' },
+  pending: { text: '进行中', cls: 'live' },
+};
+
+function renderTurns(d) {
+  sectionError('turn-err', null);
+  var counts = d.counts || {};
+  var summary =
+    '本次窗口共 ' + d.totalTurns + ' 次对话（已完成 ' + (counts.completed || 0) +
+    ' · 未收尾 ' + (counts.unfinished || 0) + ' · 进行中 ' + (counts.pending || 0) + '）';
+  fillTable('turn-body', 11, d.turns, function (t) {
     var tr = el('tr');
-    tr.appendChild(el('td', null, fmtTime(s.endedAt)));
-    var name = el('td', 'name');
-    var title = el('span', null, s.title || s.sessionId);
-    title.title = s.sessionId;
-    name.appendChild(title);
-    if (s.title) name.appendChild(el('span', 'sub', s.sessionId.slice(0, 12) + '…'));
-    tr.appendChild(name);
-    tr.appendChild(el('td', null, s.agentName || '--'));
-    var dur = Date.parse(s.endedAt) - Date.parse(s.startedAt);
-    tr.appendChild(el('td', null, Number.isNaN(dur) ? '--' : fmtDur(dur)));
-    tr.appendChild(tdNum(s.calls));
-    tr.appendChild(tdNum(s.totalTokens));
-    var rateCell = tdRate(s.outputRate);
-    rateCell.title = s.rateBasis === 'archive-span'
-      ? '归档口径：输出 tokens ÷ 会话用量跨度（v2 起两端均取实际用量时刻，不含结束前的空闲）'
-      : '归档口径：输出 tokens ÷ 会话起止时长（v1 旧记录，结束时间取归档时刻，可能含空闲）';
+    tr.appendChild(el('td', null, fmtTime(t.startedAt)));
+
+    // the user's own words — this is the point of the table
+    var msg = el('td', 'name');
+    var text = (t.userPreview || '').replace(/\s+/g, ' ').trim();
+    msg.appendChild(el('span', null, text || '（无用户消息记录）'));
+    if (text.length > 60) msg.firstChild.title = text;
+    tr.appendChild(msg);
+
+    var st = TURN_STATUS[t.status] || { text: t.status, cls: '' };
+    var stCell = el('td');
+    stCell.appendChild(el('span', 'tag ' + st.cls, st.text));
+    if (t.finishReason) stCell.title = '末条 finish_reason = ' + t.finishReason;
+    tr.appendChild(stCell);
+
+    tr.appendChild(el('td', null, t.durationMs == null ? '--' : fmtDur(t.durationMs)));
+    tr.appendChild(tdNum(t.calls));
+    tr.appendChild(tdNum(t.outputTokens));
+    tr.appendChild(tdNum(t.totalTokens));
+
+    var rateCell = tdRate(t.outputRate);
+    rateCell.title = '与界面同口径：该次对话内 Σ输出 tokens ÷ Σdecode 时长（不含等待与工具执行）';
     tr.appendChild(rateCell);
-    tr.appendChild(tdHit(s.cacheHitRate));
+    if (t.rate && t.rate.n) {
+      var sub = el('div', 'sub', 'P50 ' + t.rate.p50 + ' · ' + t.rate.n + ' 次');
+      rateCell.appendChild(sub);
+    }
+
+    tr.appendChild(tdHit(t.cacheHitRate));
+
+    var sess = el('td', 'name');
+    sess.appendChild(el('span', null, t.sessionTitle || t.sessionId.slice(0, 12) + '…'));
+    sess.firstChild.title = t.sessionId;
+    tr.appendChild(sess);
+
     var models = el('td', 'name');
-    models.appendChild(el('span', null, topModelNames(s.byModel || [], 2) || '--'));
+    models.appendChild(el('span', null, topModelNames(t.byModel || [], 2) || '--'));
     tr.appendChild(models);
     return tr;
-  }, d.hint || '暂无快照');
+  }, '暂无对话记录');
+  sectionError('turn-err', null);
+  var card = $('turn-body') && $('turn-body').closest ? $('turn-body').closest('.card') : null;
+  if (card && !card.querySelector('.turn-summary')) {
+    var note = el('div', 'turn-summary', summary);
+    card.querySelector('.card-head').appendChild(note);
+  } else if (card) {
+    card.querySelector('.turn-summary').textContent = summary;
+  }
 }
 
 /* ---------- data loading ---------- */
@@ -923,13 +963,15 @@ async function refreshDaily() {
     fillTable('daily-body', 11, [], null, '加载失败');
   }
 }
-async function refreshSnapshots() {
+async function refreshTurns() {
+  var w = windowMs();
+  if (!Number.isFinite(w.start) || !Number.isFinite(w.end) || w.end <= w.start) return; // 窗口非法时由趋势区报错
   try {
-    var d = await api('/api/snapshots?limit=' + $('snap-limit').value);
-    renderSnapshots(d);
+    var d = await api('/api/turns' + windowQuery() + '&limit=' + $('turn-limit').value);
+    renderTurns(d);
   } catch (e) {
-    sectionError('snap-err', '快照加载失败：' + e.message);
-    fillTable('snap-body', 9, [], null, '加载失败');
+    sectionError('turn-err', '对话明细加载失败：' + e.message);
+    fillTable('turn-body', 11, [], null, '加载失败');
   }
 }
 async function refreshCalls() {
@@ -946,7 +988,7 @@ async function refreshCalls() {
 function refreshTables() {
   refreshSessions();
   refreshDaily();
-  refreshSnapshots();
+  refreshTurns();
   refreshCalls();
 }
 
@@ -958,7 +1000,7 @@ async function refreshHealth() {
       return;
     }
     $('page-foot').textContent =
-      '口径：总 tokens = 输入 + 输出 + 推理 + 缓存读 + 缓存写；命中率 = 缓存读 / (缓存读 + 输入)；输出速率 = 输出 tokens ÷ decode 时长（首 token 到流结束，MiniMax Code 同口径）；历史快照表为归档口径。' +
+      '口径：总 tokens = 输入 + 输出 + 推理 + 缓存读 + 缓存写；命中率 = 缓存读 / (缓存读 + 输入)；输出速率 = 输出 tokens ÷ decode 时长（首 token 到流结束，MiniMax Code 同口径）；对话明细以一次提问（turn）为单位，实时读取、无需关闭会话。' +
       '数据源：runtime sqlite（' + fmt.format(h.usageRows == null ? 0 : h.usageRows) + ' 行，只读）· Node ' + h.runtime.node +
       (h.runtime.queryMode === 'child' ? ' · 子进程查询' : '') + '。';
   } catch (e) {
@@ -1033,7 +1075,7 @@ $('refresh-all').addEventListener('click', refreshAll);
 $('sess-days').addEventListener('change', refreshSessions);
 $('sess-limit').addEventListener('change', refreshSessions);
 $('daily-days').addEventListener('change', refreshDaily);
-$('snap-limit').addEventListener('change', refreshSnapshots);
+$('turn-limit').addEventListener('change', refreshTurns);
 $('calls-limit').addEventListener('change', refreshCalls);
 
 /* line toggle chips */

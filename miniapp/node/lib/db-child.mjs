@@ -4,7 +4,7 @@
 // Prints exactly one JSON document on stdout; exits non-zero on failure.
 import { resolveDataDir } from './common.mjs';
 import { buildTrendResult, resolveTrendWindow } from './trend.mjs';
-import { querySummary, querySessions, queryDaily, querySnapshots, queryWindow, queryCalls } from './queries.mjs';
+import { querySummary, querySessions, queryDaily, querySnapshots, queryWindow, queryCalls, queryTurns } from './queries.mjs';
 
 function run(mode, params) {
   const dataDir = params?.dataDir || resolveDataDir();
@@ -36,6 +36,8 @@ function run(mode, params) {
       return querySnapshots({ dataDir, ...params });
     case 'calls':
       return queryCalls({ dataDir, ...params }, now);
+    case 'turns':
+      return queryTurns({ dataDir, ...params }, now);
     default:
       throw new Error(`unknown mode: ${mode}`);
   }

@@ -2,10 +2,11 @@
 // routes (in-process) and the child-process fallback (db-child.mjs). All reads
 // are read-only against the MiniMax Code runtime state.
 //
-// Rate methodology (v1.2): token 输出速率 = 单次成功调用的 decode 速率
-//（输出 tokens ÷ 首 token 到流结束的解码时长，取自 assistant 消息的
-// usage.decode_duration_ms）在统计范围内的算术平均。没有 decode 记录的老数据
-// 不参与平均，避免被口径外的数值稀释。
+// Rate methodology (v1.5): token 输出速率 与 MiniMax Code 界面同口径 ——
+// 单次成功调用为 输出 tokens ÷ decode 时长（首 token 到流结束，取自 assistant
+// 消息的 usage.decode_duration_ms）；跨调用的聚合一律为 Σ输出 ÷ Σdecode 耗时
+//（时间加权），不使用逐次算术平均。没有 decode 记录的老数据不参与，避免被口径
+// 外的数值稀释。被截断的流（decode > request）不计入聚合，逐次值仍展示。
 import fs from 'node:fs';
 import {
   openDb,
@@ -13,6 +14,7 @@ import {
   loadCatalog,
   loadTurnEnrichment,
   buildLedgerWithDb,
+  loadTurnMessageMeta,
   meanCallRate,
   rateStats,
   decodeRateStats,
@@ -34,6 +36,7 @@ export const NOTES = [
   'costUsd 为 runtime 记录值；自定义套餐/订阅类提供商通常为 0，不代表实际账单。',
   '请求全程速率（对照列）= 输出 tokens ÷ request_duration_ms（发起请求到流结束），与输出速率的差值即首字等待与排队；个别调用在流被截断时 decode 计时只记到末尾，该值不计入输出速率统计。',
   'model 字段由 runtime 日志 llm_response_identifiers 按 turn 补全（按小时文件名覆盖整个窗口）；仍为 unknown 的记录早于日志保留期。',
+  '对话明细：每行是一次完整对话，即用户发送一条消息后，模型经过若干次调用直至给出最终回答（turn_id 即该单位）；实时读取，无需等待会话结束。状态分为已完成（末条 finish_reason=stop）、未收尾（末条仍为 toolUse 等）与进行中（尚无 assistant 消息）。',
   '统计范围限于本机 runtime 数据库当前保留的数据；更早的历史见快照（SessionEnd Hook 归档）。',
 ];
 
@@ -50,6 +53,7 @@ export function openContext(dataDir, startMs, endMs, now = Date.now()) {
   const catalog = loadCatalog(dataDir);
   const { map: enrichment, filesScanned } = loadTurnEnrichment(dataDir, startMs, { now });
   const ledger = buildLedgerWithDb(db, rows, enrichment, catalog);
+  const turnMeta = loadTurnMessageMeta(db, rows);
   const meta = {
     dataDir,
     window: {
@@ -65,7 +69,7 @@ export function openContext(dataDir, startMs, endMs, now = Date.now()) {
     turnsEnriched: enrichment.size,
     generatedAt: new Date(now).toISOString(),
   };
-  return { db, rows, catalog, enrichment, ledger, filesScanned, dataDir, meta };
+  return { db, rows, catalog, enrichment, ledger, turnMeta, filesScanned, dataDir, meta };
 }
 
 export function groupByModel(ctx) {
@@ -181,6 +185,117 @@ export function queryCalls({ dataDir, startAt, endAt, days, limit }, now = Date.
       rateMeasured: ctx.meta.rateMeasured,
       rate: ctx.meta.rate,
       decodeRate: ctx.meta.decodeRate,
+      notes: NOTES,
+      meta: ctx.meta,
+    };
+  } finally {
+    ctx.db.close();
+  }
+}
+
+// turns: one row per conversation — a single user message plus however many
+// model calls the agent needed before answering. Read live from the database, so
+// it works while the conversation is still running and never waits for SessionEnd.
+//
+// Rate uses the same basis as the KPI (Σoutput ÷ Σdecode); wall-clock span is
+// reported separately as 时长 and is deliberately NOT used as the denominator,
+// otherwise a long conversation with a slow tail would read as a slow model.
+export function queryTurns({ dataDir, startAt, endAt, days, limit }, now = Date.now()) {
+  const lim = clampInt(limit, 1, 500, 120);
+  const { startMs, endMs } = resolveTrendWindow({ startAt, endAt, days: days ?? 1 }, now);
+  const ctx = openContext(dataDir, startMs, endMs, now);
+  try {
+    const byTurn = new Map();
+    for (const call of ctx.ledger) {
+      if (!call.turnId) continue;
+      if (!byTurn.has(call.turnId)) {
+        byTurn.set(call.turnId, {
+          total: emptyMetrics(),
+          calls: [],
+          firstTs: call.ts,
+          lastCallTs: call.ts,
+          groups: new Map(),
+          sessionId: call.sessionId,
+          agentName: call.agentName || null,
+        });
+      }
+      const t = byTurn.get(call.turnId);
+      t.firstTs = Math.min(t.firstTs, call.ts);
+      t.lastCallTs = Math.max(t.lastCallTs, call.ts);
+      addRow(t.total, call);
+      t.calls.push(call);
+      const gk = `${call.provider}|${call.model}`;
+      if (!t.groups.has(gk)) {
+        t.groups.set(gk, {
+          provider: call.provider,
+          providerName: call.providerName,
+          model: call.model,
+          modelName: call.modelName,
+          custom: call.custom,
+          metrics: emptyMetrics(),
+          callList: [],
+        });
+      }
+      const g = t.groups.get(gk);
+      addRow(g.metrics, call);
+      g.callList.push(call);
+    }
+
+    const titles = new Map();
+    try {
+      for (const r of ctx.db.prepare('SELECT session_id, title FROM local_runtime_sessions').all()) {
+        titles.set(r.session_id, r.title || null);
+      }
+    } catch {
+      // titles optional
+    }
+
+    const turns = [...byTurn.entries()]
+      .map(([turnId, t]) => {
+        const meta = ctx.turnMeta.get(turnId) || null;
+        const startedMs = meta?.userTs != null ? Math.min(meta.userTs, t.firstTs) : t.firstTs;
+        const endedMs = meta?.lastTs != null ? meta.lastTs : null;
+        const finished = endedMs != null && (meta?.assistantCount || 0) > 0;
+        let status = 'pending';
+        if (finished) status = meta.finishReason === 'stop' ? 'completed' : 'unfinished';
+        const models = sortGroups(
+          [...t.groups.values()].map((g) => ({
+            ...g,
+            ...finalize(g.metrics),
+            outputRate: meanCallRate(g.callList),
+            metrics: undefined,
+            callList: undefined,
+          })),
+        );
+        const metrics = finalize(t.total);
+        return {
+          turnId,
+          sessionId: t.sessionId,
+          sessionTitle: titles.get(t.sessionId) || null,
+          agentName: t.agentName,
+          startedAt: new Date(startedMs).toISOString(),
+          endedAt: endedMs != null ? new Date(endedMs).toISOString() : null,
+          durationMs: endedMs != null ? endedMs - startedMs : null,
+          status,
+          finishReason: meta?.finishReason || null,
+          userPreview: meta?.userPreview || null,
+          ...metrics,
+          outputRate: meanCallRate(t.calls),
+          rate: rateStats(t.calls),
+          byModel: models,
+        };
+      })
+      .sort((a, b) => (a.startedAt < b.startedAt ? 1 : -1))
+      .slice(0, lim);
+
+    const counts = { completed: 0, unfinished: 0, pending: 0 };
+    for (const t of turns) counts[t.status] = (counts[t.status] || 0) + 1;
+
+    return {
+      window: ctx.meta.window,
+      turns,
+      totalTurns: byTurn.size,
+      counts,
       notes: NOTES,
       meta: ctx.meta,
     };

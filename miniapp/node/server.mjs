@@ -9,7 +9,7 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { resolveDataDir, openDb } from './lib/common.mjs';
 import { resolveTrendWindow, buildTrendResult } from './lib/trend.mjs';
-import { querySummary, querySessions, queryDaily, querySnapshots, queryWindow, queryCalls } from './lib/queries.mjs';
+import { querySummary, querySessions, queryDaily, querySnapshots, queryWindow, queryCalls, queryTurns } from './lib/queries.mjs';
 
 /** @typedef {import('./miniapp-api.js').MiniAppContext} MiniAppContext */
 /** @typedef {import('./miniapp-api.js').MiniAppLifecycle} MiniAppLifecycle */
@@ -63,6 +63,7 @@ export async function start(context) {
     daily: (p) => queryDaily({ dataDir, ...p }),
     snapshots: (p) => querySnapshots({ dataDir, ...p }),
     calls: (p) => queryCalls({ dataDir, ...p }),
+    turns: (p) => queryTurns({ dataDir, ...p }),
   };
 
   function runChild(mode, params) {
@@ -187,6 +188,7 @@ export async function start(context) {
     '/api/daily': 'daily',
     '/api/snapshots': 'snapshots',
     '/api/calls': 'calls',
+    '/api/turns': 'turns',
   };
 
   const server = http.createServer((request, response) => {

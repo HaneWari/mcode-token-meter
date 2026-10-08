@@ -425,6 +425,65 @@ export function loadAssistantCallDetails(db, rows) {
   return byTurn;
 }
 
+// Per-turn message metadata for the conversation table.
+//
+// A turn is exactly one user message followed by however many model calls the
+// agent needed before answering, so it is the natural unit for "one thing the
+// user asked" — and unlike the SessionEnd archive it is readable from the
+// database the instant the first usage row of that turn lands, with no hook and
+// no waiting for the session to close. Verified on this machine: 26 turns today,
+// 24 carrying exactly one user message, 0 carrying more than one, and all 26
+// ending on an assistant message.
+export function loadTurnMessageMeta(db, rows) {
+  const meta = new Map(); // turn_id -> {userTs, userPreview, lastTs, finishReason, assistantCount}
+  const turnIds = new Set();
+  for (const r of rows) if (r.turn_id) turnIds.add(r.turn_id);
+  if (!turnIds.size) return meta;
+  const ids = [...turnIds];
+  const CHUNK = 250;
+  for (let i = 0; i < ids.length; i += CHUNK) {
+    const slice = ids.slice(i, i + CHUNK);
+    const placeholders = slice.map(() => '?').join(',');
+    let stmt;
+    try {
+      stmt = db.prepare(
+        `SELECT turn_id, role, created_at_ms, data_json
+           FROM local_runtime_message_rows
+          WHERE turn_id IN (${placeholders})
+          ORDER BY created_at_ms`,
+      );
+    } catch {
+      return meta; // message table missing on older runtimes
+    }
+    for (const m of stmt.iterate(...slice)) {
+      if (!m.turn_id) continue;
+      let e = meta.get(m.turn_id);
+      if (!e) {
+        e = { userTs: null, userPreview: null, lastTs: null, finishReason: null, assistantCount: 0 };
+        meta.set(m.turn_id, e);
+      }
+      if (m.created_at_ms != null && (e.lastTs == null || m.created_at_ms > e.lastTs)) e.lastTs = m.created_at_ms;
+      let d = null;
+      try {
+        d = JSON.parse(m.data_json);
+      } catch {
+        d = null;
+      }
+      if (m.role === 'user') {
+        // first user message opens the turn
+        if (e.userTs == null || m.created_at_ms < e.userTs) {
+          e.userTs = m.created_at_ms;
+          if (d && typeof d.msg_content === 'string') e.userPreview = d.msg_content;
+        }
+      } else if (m.role === 'assistant') {
+        e.assistantCount += 1;
+        if (d && typeof d.finish_reason === 'string') e.finishReason = d.finish_reason;
+      }
+    }
+  }
+  return meta;
+}
+
 function nearestByTime(list, ts, tolerance) {
   // list is sorted by ts; linear scan with an early exit is fine (per-turn lists are short)
   let best = null;
