@@ -15,9 +15,9 @@ import {
   finalize,
   buildLedgerWithDb,
   meanCallRate,
-  meanRequestCallRate,
+  rateStats,
+  decodeRateStats,
   countRatedCalls,
-  countRateOutliers,
 } from './common.mjs';
 
 export function parseLocalDateTime(value) {
@@ -138,7 +138,7 @@ export function buildTrendFromContext(ctx, { startMs, endMs, bucket: requestedBu
     }
     const b = buckets.get(bStart);
     addRow(b.totals, call);
-    if (typeof call.rate === 'number' && !call.rateOutlier) b.rates.push(call.rate);
+    if (typeof call.rate === 'number') b.rates.push(call.rate);
     const modelKey = `${call.provider}|${call.model}`;
     const key = topKeys.includes(modelKey) ? modelKey : '__other__';
     const rowTotal =
@@ -180,9 +180,9 @@ export function buildTrendFromContext(ctx, { startMs, endMs, bucket: requestedBu
   }
   finalize(kpi);
   kpi.outputRate = meanCallRate(ledger);
-  kpi.requestRate = meanRequestCallRate(ledger);
+  kpi.rate = rateStats(ledger);
+  kpi.decodeRate = decodeRateStats(ledger);
   kpi.rateMeasured = countRatedCalls(ledger);
-  kpi.rateOutliers = countRateOutliers(ledger);
 
   return {
     window: {

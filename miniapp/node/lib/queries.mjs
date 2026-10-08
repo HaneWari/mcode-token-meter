@@ -14,8 +14,9 @@ import {
   loadTurnEnrichment,
   buildLedgerWithDb,
   meanCallRate,
+  rateStats,
+  decodeRateStats,
   countRatedCalls,
-  countRateOutliers,
   emptyMetrics,
   addRow,
   finalize,
@@ -29,8 +30,9 @@ import { resolveTrendWindow, buildTrendFromContext } from './trend.mjs';
 export const NOTES = [
   'cacheHitRate = cacheReadTokens / (cacheReadTokens + inputTokens)，表示提示词中命中缓存的比例；cacheWriteTokens 不计入分母。',
   'totalTokens = input + output + reasoning + cacheRead + cacheWrite。',
-  'token 输出速率（token/s）= 单次成功调用（状态 200）的 输出 tokens ÷ decode 时长（首 token 到流结束，runtime 记录的 usage.decode_duration_ms），再取范围内可测调用的算术平均。调用日志同时给出 API 全程速率（输出 ÷ request_duration_ms，与 CC Switch 的 speed 口径一致），decode 速率通常高于全程速率，差值即首字等待与排队时间。',
+  'token 输出速率（token/s）= 单次成功调用（状态 200）的 输出 tokens ÷ 请求全程时长（request_duration_ms，发起请求到流结束）——与 MiniMax Code 自身的 pi_llm_tokens_per_second 及 CC Switch 的 speed 口径一致；窗口值为这些逐次速率的均值，并同时给出 P50/P90。',
   'costUsd 为 runtime 记录值；自定义套餐/订阅类提供商通常为 0，不代表实际账单。',
+  '纯生成速率（对照列）= 输出 tokens ÷ decode 时长（首 token 到流结束），与全程速率的差值即首字等待与排队；个别调用在流被截断时 decode 计时只记到末尾，该值不计入 decode 统计。',
   'model 字段由 runtime 日志 llm_response_identifiers 按 turn 补全（按小时文件名覆盖整个窗口）；仍为 unknown 的记录早于日志保留期。',
   '统计范围限于本机 runtime 数据库当前保留的数据；更早的历史见快照（SessionEnd Hook 归档）。',
 ];
@@ -57,7 +59,8 @@ export function openContext(dataDir, startMs, endMs, now = Date.now()) {
     },
     rows: rows.length,
     rateMeasured: countRatedCalls(ledger),
-    rateOutliers: countRateOutliers(ledger),
+    rate: rateStats(ledger),
+    decodeRate: decodeRateStats(ledger),
     logFilesScanned: filesScanned,
     turnsEnriched: enrichment.size,
     generatedAt: new Date(now).toISOString(),
@@ -104,7 +107,7 @@ function summaryFromContext(ctx) {
   const { byModel, total, unknownRows } = groupByModel(ctx);
   return {
     window: ctx.meta.window,
-    total: { ...total, outputRate: meanCallRate(ctx.ledger), rateMeasured: ctx.meta.rateMeasured },
+    total: { ...total, outputRate: meanCallRate(ctx.ledger), rate: rateStats(ctx.ledger), rateMeasured: ctx.meta.rateMeasured },
     byModel,
     unknownRows,
     notes: NOTES,
@@ -169,15 +172,15 @@ export function queryCalls({ dataDir, startAt, endAt, days, limit }, now = Date.
         status: c.status,
         finishReason: c.finishReason,
         outputRate: c.rate,
-        requestRate: c.requestRate,
-        rateOutlier: Boolean(c.rateOutlier),
+        decodeRate: c.decodeRate,
       }));
     return {
       window: ctx.meta.window,
       calls,
       totalCalls: ctx.ledger.length,
       rateMeasured: ctx.meta.rateMeasured,
-      rateOutliers: ctx.meta.rateOutliers,
+      rate: ctx.meta.rate,
+      decodeRate: ctx.meta.decodeRate,
       notes: NOTES,
       meta: ctx.meta,
     };
@@ -256,6 +259,7 @@ export function querySessions({ dataDir, startAt, endAt, days, limit }, now = Da
           lastActivity: new Date(s.lastTs).toISOString(),
           ...metrics,
           outputRate: meanCallRate(s.calls),
+          rate: rateStats(s.calls),
           byModel: models,
         };
       })
@@ -303,7 +307,7 @@ export function queryDaily({ dataDir, days }, now = Date.now()) {
         const total = finalize(v.total);
         return {
           day,
-          total: { ...total, outputRate: meanCallRate(v.calls) },
+          total: { ...total, outputRate: meanCallRate(v.calls), rate: rateStats(v.calls) },
           byModel: sortGroups(
             [...v.groups.values()].map((g) => ({
               ...g,

@@ -241,7 +241,7 @@ td .sub { display: block; font-size: 11px; color: var(--mcode-text-subtle); }
     <div class="cell"><div class="v" id="kpi-total">--</div><div class="l">总 tokens</div><div class="s" id="kpi-total-sub"></div></div>
     <div class="cell"><div class="v" id="kpi-calls">--</div><div class="l">调用次数</div><div class="s" id="kpi-calls-sub"></div></div>
     <div class="cell"><div class="v" id="kpi-hit">--</div><div class="l">缓存命中率</div><div class="s">cacheRead / (cacheRead + input)</div></div>
-    <div class="cell"><div class="v"><span id="kpi-rate">--</span><span class="unit">tok/s</span></div><div class="l">token 输出速率</div><div class="s" id="kpi-rate-sub">decode 均值</div></div>
+    <div class="cell"><div class="v"><span id="kpi-rate">--</span><span class="unit">tok/s</span></div><div class="l">token 输出速率</div><div class="s" id="kpi-rate-sub">中位数</div></div>
     <div class="cell"><div class="v" id="kpi-models">--</div><div class="l">活跃模型</div><div class="s" id="kpi-models-sub"></div></div>
   </section>
 
@@ -316,7 +316,7 @@ td .sub { display: block; font-size: 11px; color: var(--mcode-text-subtle); }
       <table>
         <thead><tr>
           <th>时间</th><th class="name">模型</th><th>输入</th><th>输出</th><th>推理</th>
-          <th>缓存读</th><th>缓存写</th><th>速率 (tok/s)</th><th>全程 (tok/s)</th><th>decode</th><th>状态码</th>
+          <th>缓存读</th><th>缓存写</th><th>速率 (tok/s)</th><th>纯生成</th><th>全程耗时</th><th>状态码</th>
         </tr></thead>
         <tbody id="calls-body"><tr class="empty-row"><td colspan="11">加载中…</td></tr></tbody>
       </table>
@@ -368,7 +368,7 @@ td .sub { display: block; font-size: 11px; color: var(--mcode-text-subtle); }
   </section>
 
   <footer class="page-foot" id="page-foot">
-    口径：总 tokens = 输入 + 输出 + 推理 + 缓存读 + 缓存写；命中率 = 缓存读 / (缓存读 + 输入)；输出速率 = 单次成功调用的 输出 tokens ÷ decode 时长（首 token 到流结束）的算术平均，调用日志同时给出 API 全程速率（含首字等待，CC Switch speed 口径）；历史快照表为归档口径（输出 ÷ 会话起止时长）。数据来自本机 runtime 用量记录（sqlite + 日志按 turn 补全 + config.yaml 显示名），只读。
+    口径：总 tokens = 输入 + 输出 + 推理 + 缓存读 + 缓存写；命中率 = 缓存读 / (缓存读 + 输入)；输出速率 = 单次成功调用的 输出 tokens ÷ 请求全程时长（与 MiniMax Code 自身的 pi_llm_tokens_per_second、CC Switch speed 口径一致），窗口内以中位数与均值同时呈现，调用日志另列纯生成速率（首 token → 流结束）；历史快照表为归档口径（输出 ÷ 会话起止时长）。数据来自本机 runtime 用量记录（sqlite + 日志按 turn 补全 + config.yaml 显示名），只读。
   </footer>
 </div>
 <div class="toast" id="toast" role="status"></div>
@@ -678,12 +678,14 @@ function renderTrend(d) {
   $('kpi-calls').textContent = fmt.format(d.kpis.calls);
   $('kpi-calls-sub').textContent = d.series.totalTokens.length ? '峰值 ' + compact(Math.max.apply(null, d.series.totalTokens.concat([0]))) + ' / 桶' : '';
   $('kpi-hit').textContent = pct(d.kpis.cacheHitRate);
-  $('kpi-rate').textContent = rateFmt(d.kpis.outputRate);
-  $('kpi-rate-sub').textContent = 'decode 均值 · ' + fmt.format(d.kpis.rateMeasured || 0) + '/' + fmt.format(d.kpis.calls) + ' 可测';
-  $('kpi-rate-sub').title = 'decode 均值 = 输出 tokens ÷ decode 时长（首 token 到流结束）的算术平均；' +
-    fmt.format(d.kpis.rateMeasured || 0) + '/' + fmt.format(d.kpis.calls) + ' 次可测' +
-    (d.kpis.rateOutliers ? '，' + d.kpis.rateOutliers + ' 次计时残缺已剔除' : '') +
-    '。API 全程均值（含首字等待，CC Switch 口径）= ' + rateFmt(d.kpis.requestRate) + ' tok/s';
+  var rs = d.kpis.rate || {};
+  $('kpi-rate').textContent = rateFmt(rs.p50 != null ? rs.p50 : d.kpis.outputRate);
+  $('kpi-rate-sub').textContent = 'P50 · 均值 ' + rateFmt(rs.mean) + ' · N=' + fmt.format(rs.n || 0);
+  var ds = d.kpis.decodeRate || {};
+  $('kpi-rate-sub').title = '口径：输出 tokens ÷ 请求全程时长（发起请求 → 流结束），与 MiniMax Code 的 pi_llm_tokens_per_second 及 CC Switch speed 一致。\n' +
+    '当前窗口 ' + (rs.n || 0) + '/' + fmt.format(d.kpis.calls) + ' 次可测，P50 ' + rateFmt(rs.p50) + '、均值 ' + rateFmt(rs.mean) +
+    '、P90 ' + rateFmt(rs.p90) + '、峰值 ' + rateFmt(rs.max) + ' tok/s。\n' +
+    '纯生成速率（首 token → 流结束）中位数 ' + rateFmt(ds.p50) + ' tok/s，与全程速率的差值即首字等待与排队。';
   $('kpi-models').textContent = d.kpis.activeModels;
   $('kpi-models-sub').textContent = d.models.map(function (m) { return m.modelName; }).join(' · ');
 
@@ -694,7 +696,7 @@ function renderTrend(d) {
   $('trend-foot').textContent =
     '来源：本机 runtime 用量记录（sqlite + 日志补全）' +
     (d.unknownRows > 0 ? ' · ' + d.unknownRows + ' 条未识别模型（早于日志保留期）' : '') +
-    ' · 命中率 = cacheRead / (cacheRead + input) · 速率 = 桶内成功调用的 decode 速率均值，无调用的桶不绘制';
+    ' · 命中率 = cacheRead / (cacheRead + input) · 速率 = 桶内成功调用的速率均值（输出 ÷ 请求全程），无调用的桶不绘制';
 
   rebuildChart(d);
 }
@@ -764,22 +766,22 @@ function renderCalls(d) {
     tr.appendChild(tdNum(c.cacheReadTokens));
     tr.appendChild(tdNum(c.cacheWriteTokens));
     var rateCell = tdRate(c.outputRate);
-    if (c.rateOutlier) {
-      rateCell.classList.add('rate-warn');
-      rateCell.appendChild(el('span', null, ' ⚠'));
-      rateCell.title = 'decode 计时残缺（该次流被截断，只记到末尾），未计入速率均值 · 原始值 ' + rateFmt(c.outputRate) + ' tok/s · 全程速率 ' + rateFmt(c.requestRate);
-    } else {
-      rateCell.title = c.decodeMs != null
-        ? '输出 tokens ÷ decode ' + fmt.format(c.decodeMs) + 'ms（首 token 到流结束）'
-        : '该调用无 decode 计时（老数据），不参与速率均值';
-    }
+    rateCell.title = c.requestMs != null
+      ? '输出 ' + fmt.format(c.outputTokens) + ' tokens ÷ 请求全程 ' + fmt.format(c.requestMs) + 'ms（MiniMax Code / CC Switch 口径）' +
+        (c.finishReason ? ' · ' + c.finishReason : '')
+      : '该调用无请求计时（老数据），不参与速率统计';
     tr.appendChild(rateCell);
-    var fullCell = tdRate(c.requestRate);
-    fullCell.title = '输出 tokens ÷ 请求全程 ' + (c.requestMs != null ? fmt.format(c.requestMs) + 'ms' : '--') +
-      (c.finishReason ? ' · ' + c.finishReason : '') + '（含首字等待，CC Switch speed 口径）';
-    tr.appendChild(fullCell);
-    var dec = el('td', null, c.decodeMs != null ? (c.decodeMs / 1000).toFixed(1) + 's' : '--');
-    tr.appendChild(dec);
+    var decCell = tdRate(c.decodeRate);
+    decCell.title = c.decodeMs != null
+      ? '输出 tokens ÷ decode ' + fmt.format(c.decodeMs) + 'ms（首 token → 流结束）；与全程速率的差值即首字等待与排队'
+      : '无 decode 计时';
+    if (c.decodeRate != null && c.decodeRate > 600) decCell.classList.add('rate-warn'); // 流被截断，decode 计时只记到末尾
+    tr.appendChild(decCell);
+    var durCell = el('td', null, c.requestMs != null ? (c.requestMs / 1000).toFixed(1) + 's' : '--');
+    durCell.title = c.requestMs != null
+      ? '请求全程 ' + fmt.format(c.requestMs) + 'ms' + (c.decodeMs != null ? ' · 其中 decode ' + fmt.format(c.decodeMs) + 'ms' : '')
+      : '';
+    tr.appendChild(durCell);
     var st = el('td', c.status == null ? null : c.status === 200 ? 'hit' : 'hit low', c.status == null ? '—' : String(c.status));
     tr.appendChild(st);
     return tr;
@@ -800,7 +802,10 @@ function renderSessions(d) {
     tr.appendChild(tdNum(s.calls));
     tr.appendChild(tdNum(s.totalTokens));
     var rateCell = tdRate(s.outputRate);
-    rateCell.title = '该会话成功调用的 decode 速率均值';
+    rateCell.title = '该会话成功调用的速率均值（输出 ÷ 请求全程）';
+    if (s.rate && s.rate.n) {
+      rateCell.appendChild(el('span', 'sub', 'P50 ' + rateFmt(s.rate.p50) + ' · P90 ' + rateFmt(s.rate.p90)));
+    }
     tr.appendChild(rateCell);
     tr.appendChild(tdHit(s.cacheHitRate));
     var models = el('td', 'name');
@@ -825,7 +830,7 @@ function renderDaily(d) {
     tr.appendChild(tdNum(day.total.cacheWriteTokens));
     tr.appendChild(tdNum(day.total.totalTokens));
     var rateCell = tdRate(day.total.outputRate);
-    rateCell.title = '当天成功调用的 decode 速率均值';
+    rateCell.title = '当天成功调用的速率均值（输出 ÷ 请求全程）';
     tr.appendChild(rateCell);
     tr.appendChild(tdHit(day.total.cacheHitRate));
     var models = el('td', 'name');
@@ -944,7 +949,7 @@ async function refreshHealth() {
       return;
     }
     $('page-foot').textContent =
-      '口径：总 tokens = 输入 + 输出 + 推理 + 缓存读 + 缓存写；命中率 = 缓存读 / (缓存读 + 输入)；输出速率 = 单次成功调用的 输出 tokens ÷ decode 时长（首 token 到流结束）的算术平均；历史快照表为归档口径（输出 ÷ 会话起止时长）。' +
+      '口径：总 tokens = 输入 + 输出 + 推理 + 缓存读 + 缓存写；命中率 = 缓存读 / (缓存读 + 输入)；输出速率 = 单次成功调用的 输出 tokens ÷ 请求全程时长（MiniMax Code / CC Switch 口径）；历史快照表为归档口径（输出 ÷ 会话起止时长）。' +
       '数据源：runtime sqlite（' + fmt.format(h.usageRows == null ? 0 : h.usageRows) + ' 行，只读）· Node ' + h.runtime.node +
       (h.runtime.queryMode === 'child' ? ' · 子进程查询' : '') + '。';
   } catch (e) {

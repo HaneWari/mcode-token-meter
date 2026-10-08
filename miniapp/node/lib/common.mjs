@@ -362,11 +362,11 @@ export function sortGroups(groups) {
 // --- per-call ledger (usage rows joined with message timing + log status) ----
 //
 // local_runtime_token_usage never stores the model and has no call duration.
-// Two side sources complete the picture:
-//   - assistant message rows (local_runtime_message_rows.data_json) carry
-//     usage.decode_duration_ms (first token -> stream end) and
-//     request_duration_ms (whole API call, the CC Switch "API duration" basis);
-//   - llm_response_identifiers log lines carry response_status.
+// One side source completes the picture: assistant message rows
+// (local_runtime_message_rows.data_json) carry the very timings MiniMax Code
+// itself uses for pi_llm_tokens_per_second — usage.request_duration_ms (request
+// start → stream end) and usage.decode_duration_ms (first token → stream end) —
+// plus finish_reason. Log lines additionally carry response_status.
 //
 // Pairing: within a turn the two sequences are strictly interleaved —
 // usage row[i].ts equals message[i-1].created_at_ms exactly, i.e. a usage row
@@ -481,10 +481,13 @@ export function buildCallLedger(rows, enrichment, assistantByTurn, catalog) {
     const requestMs = msg ? msg.requestMs : null;
     const output = row.output_tokens || 0;
     const succeeded = status == null || status === 200; // a recorded usage row implies a completed call
-    const rate = succeeded && decodeMs > 0 && output > 0 ? Math.round((output / (decodeMs / 1000)) * 100) / 100 : null;
-    // CC Switch "speed" basis: output tokens ÷ whole API call duration.
-    const requestRate =
-      succeeded && requestMs > 0 && output > 0 ? Math.round((output / (requestMs / 1000)) * 100) / 100 : null;
+    // Official rate (matches MiniMax Code's pi_llm_tokens_per_second and CC Switch's
+    // "speed"): output tokens ÷ whole API call duration (request start → stream end).
+    const rate = succeeded && requestMs > 0 && output > 0 ? Math.round((output / (requestMs / 1000)) * 100) / 100 : null;
+    // Pure generation speed (first token → stream end), shown as the reference column;
+    // the gap between the two is time-to-first-token plus queueing.
+    const decodeRate =
+      succeeded && decodeMs > 0 && output > 0 ? Math.round((output / (decodeMs / 1000)) * 100) / 100 : null;
     ledger.push({
       ts: row.ts,
       sessionId: row.session_id,
@@ -509,89 +512,80 @@ export function buildCallLedger(rows, enrichment, assistantByTurn, catalog) {
       finishReason: msg ? msg.finishReason : null,
       status,
       rate,
-      requestRate,
+      decodeRate,
     });
   }
   return ledger;
 }
 
 export function buildLedgerWithDb(db, rows, enrichment, catalog) {
-  const ledger = buildCallLedger(rows, enrichment, loadAssistantCallDetails(db, rows), catalog);
-  markRateOutliers(ledger);
-  return ledger;
+  return buildCallLedger(rows, enrichment, loadAssistantCallDetails(db, rows), catalog);
 }
 
-// --- rate sanity check --------------------------------------------------------
+// --- rate aggregation ---------------------------------------------------------
 //
-// With index pairing the decode rate is trustworthy for the bulk of calls
-// (median ~77 tok/s). A minority of calls carry a truncated decode timer — the
-// stream is cut early and only the final flush is timed (decode ~100ms while the
-// whole request ran for many seconds), which would otherwise print thousands of
-// tok/s. Such calls are flagged with two structural rules and excluded from
-// averages; the raw value stays visible in the call log:
-//   1. decode longer than the request it belongs to (impossible), or
-//   2. a decode rate beyond both 4x the window median and 600 tok/s, i.e. beyond
-//      any plausible text-generation throughput.
-// Only the high side is fenced: implausibly *slow* calls are real behaviour.
+// The primary rate follows MiniMax Code's own definition
+// (agent-core/pi-turn-runner/metrics.js: pi_llm_tokens_per_second = output tokens
+// ÷ whole API call duration), which CC Switch mirrors as its "speed". That number
+// is produced by the runtime itself, so it needs no trimming.
+//
+// Only the auxiliary decode rate can be corrupt: a truncated stream leaves a
+// ~100ms timer that yields thousands of tok/s. Such calls keep their (correct)
+// primary rate and their raw decode value is simply left out of decode stats.
 
-export function markRateOutliers(ledger) {
-  const rated = [];
-  for (const c of ledger) if (typeof c.rate === 'number') rated.push(c.rate);
-  let fence = Infinity;
-  if (rated.length >= 8) {
-    const sorted = rated.slice().sort((a, b) => a - b);
-    const median = sorted[Math.floor(sorted.length / 2)];
-    fence = Math.max(median * 4, 600);
-  }
-  let outliers = 0;
-  for (const c of ledger) {
-    c.rateOutlier = false;
-    if (typeof c.rate !== 'number') continue;
-    const decodeTooLong = c.decodeMs != null && c.requestMs != null && c.decodeMs > c.requestMs;
-    if (decodeTooLong || c.rate > fence) {
-      c.rateOutlier = true;
-      outliers += 1;
-    }
-  }
-  return outliers;
-}
-
-export function countRateOutliers(calls) {
-  let n = 0;
-  for (const c of calls) if (c.rateOutlier) n += 1;
-  return n;
-}
-
-// Mean of per-call decode rates over measured, non-outlier calls.
-export function meanCallRate(calls) {
-  let sum = 0;
-  let n = 0;
+export function collectDecodeRates(calls) {
+  const out = [];
   for (const c of calls) {
-    if (typeof c.rate === 'number' && !c.rateOutlier) {
-      sum += c.rate;
-      n += 1;
-    }
+    if (typeof c.decodeRate !== 'number') continue;
+    // decode longer than the request it belongs to is structurally impossible
+    if (c.decodeMs != null && c.requestMs != null && c.decodeMs > c.requestMs) continue;
+    out.push(c.decodeRate);
   }
-  return n ? Math.round((sum / n) * 100) / 100 : null;
+  return out;
+}
+
+function round2(v) {
+  return Math.round(v * 100) / 100;
+}
+
+export function percentile(sorted, p) {
+  if (!sorted.length) return null;
+  const idx = Math.min(sorted.length - 1, Math.max(0, Math.round((sorted.length - 1) * p)));
+  return sorted[idx];
+}
+
+function stats(values) {
+  if (!values.length) return null;
+  const sorted = values.slice().sort((a, b) => a - b);
+  const sum = sorted.reduce((s, v) => s + v, 0);
+  return {
+    mean: round2(sum / sorted.length),
+    p50: round2(percentile(sorted, 0.5)),
+    p90: round2(percentile(sorted, 0.9)),
+    max: round2(sorted[sorted.length - 1]),
+    n: sorted.length,
+  };
+}
+
+// Primary rate summary over every measured call (mean + percentiles).
+export function rateStats(calls) {
+  const values = [];
+  for (const c of calls) if (typeof c.rate === 'number') values.push(c.rate);
+  return stats(values);
+}
+
+// Mean of the primary (official) per-call rate.
+export function meanCallRate(calls) {
+  return rateStats(calls)?.mean ?? null;
 }
 
 export function countRatedCalls(calls) {
   let n = 0;
-  for (const c of calls) if (typeof c.rate === 'number' && !c.rateOutlier) n += 1;
+  for (const c of calls) if (typeof c.rate === 'number') n += 1;
   return n;
 }
 
-// Mean of the whole-call rate (output ÷ request_duration_ms), the CC Switch
-// "speed" basis. Measured over every measured call regardless of the decode
-// fence, because a truncated decode timer does not affect request_duration.
-export function meanRequestCallRate(calls) {
-  let sum = 0;
-  let n = 0;
-  for (const c of calls) {
-    if (typeof c.requestRate === 'number') {
-      sum += c.requestRate;
-      n += 1;
-    }
-  }
-  return n ? Math.round((sum / n) * 100) / 100 : null;
+// Reference decode-rate summary (pure generation speed, first token → stream end).
+export function decodeRateStats(calls) {
+  return stats(collectDecodeRates(calls));
 }
