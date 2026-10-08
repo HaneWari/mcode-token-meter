@@ -1,0 +1,347 @@
+// token-meter-board query layer: windowed usage aggregations shared by the HTTP
+// routes (in-process) and the child-process fallback (db-child.mjs). All reads
+// are read-only against the MiniMax Code runtime state.
+//
+// Rate methodology (v1.2): token 输出速率 = 单次成功调用的 decode 速率
+//（输出 tokens ÷ 首 token 到流结束的解码时长，取自 assistant 消息的
+// usage.decode_duration_ms）在统计范围内的算术平均。没有 decode 记录的老数据
+// 不参与平均，避免被口径外的数值稀释。
+import fs from 'node:fs';
+import {
+  openDb,
+  queryUsageRows,
+  loadCatalog,
+  loadTurnEnrichment,
+  buildLedgerWithDb,
+  meanCallRate,
+  countRatedCalls,
+  emptyMetrics,
+  addRow,
+  finalize,
+  sortGroups,
+  dayKey,
+  clampInt,
+  snapshotFile,
+} from './common.mjs';
+import { resolveTrendWindow, buildTrendFromContext } from './trend.mjs';
+
+export const NOTES = [
+  'cacheHitRate = cacheReadTokens / (cacheReadTokens + inputTokens)，表示提示词中命中缓存的比例；cacheWriteTokens 不计入分母。',
+  'totalTokens = input + output + reasoning + cacheRead + cacheWrite。',
+  'token 输出速率（token/s）= 单次成功调用（状态 200）的 输出 tokens ÷ decode 时长（首 token 到流结束），再取范围内所有可测调用的平均值；无 decode 记录的历史调用不参与平均。',
+  'costUsd 为 runtime 记录值；自定义套餐/订阅类提供商通常为 0，不代表实际账单。',
+  'model 字段由 runtime 日志 llm_response_identifiers 按 turn 补全（按小时文件名覆盖整个窗口）；仍为 unknown 的记录早于日志保留期。',
+  '统计范围限于本机 runtime 数据库当前保留的数据；更早的历史见快照（SessionEnd Hook 归档）。',
+];
+
+// Open the DB and load the window rows plus the per-call ledger (identity,
+// decode timing, response status). Caller must close the returned db.
+export function openContext(dataDir, startMs, endMs, now = Date.now()) {
+  const { db, error } = openDb(dataDir);
+  if (!db) {
+    const err = new Error(error || `runtime state database unavailable under ${dataDir}`);
+    err.code = 'NO_DB';
+    throw err;
+  }
+  const rows = queryUsageRows(db, startMs, endMs);
+  const catalog = loadCatalog(dataDir);
+  const { map: enrichment, filesScanned } = loadTurnEnrichment(dataDir, startMs, { now });
+  const ledger = buildLedgerWithDb(db, rows, enrichment, catalog);
+  const meta = {
+    dataDir,
+    window: {
+      label: `${dayKey(startMs)}..${dayKey(endMs)}`,
+      start: new Date(startMs).toISOString(),
+      end: new Date(endMs).toISOString(),
+    },
+    rows: rows.length,
+    rateMeasured: countRatedCalls(ledger),
+    logFilesScanned: filesScanned,
+    turnsEnriched: enrichment.size,
+    generatedAt: new Date(now).toISOString(),
+  };
+  return { db, rows, catalog, enrichment, ledger, filesScanned, dataDir, meta };
+}
+
+export function groupByModel(ctx) {
+  const groups = new Map();
+  const total = emptyMetrics();
+  let unknownRows = 0;
+  for (const call of ctx.ledger) {
+    if (call.model === '(unknown)') unknownRows += 1;
+    const key = `${call.provider}|${call.model}`;
+    if (!groups.has(key)) {
+      groups.set(key, {
+        provider: call.provider,
+        providerName: call.providerName,
+        model: call.model,
+        modelName: call.modelName,
+        custom: call.custom,
+        metrics: emptyMetrics(),
+        callList: [],
+      });
+    }
+    const g = groups.get(key);
+    addRow(g.metrics, call);
+    g.callList.push(call);
+    addRow(total, call);
+  }
+  const byModel = sortGroups(
+    [...groups.values()].map((g) => ({
+      ...g,
+      ...finalize(g.metrics),
+      outputRate: meanCallRate(g.callList),
+      metrics: undefined,
+      callList: undefined,
+    })),
+  );
+  return { byModel, total: finalize(total), unknownRows };
+}
+
+function summaryFromContext(ctx) {
+  const { byModel, total, unknownRows } = groupByModel(ctx);
+  return {
+    window: ctx.meta.window,
+    total: { ...total, outputRate: meanCallRate(ctx.ledger), rateMeasured: ctx.meta.rateMeasured },
+    byModel,
+    unknownRows,
+    notes: NOTES,
+    meta: ctx.meta,
+  };
+}
+
+// summary: window (startAt/endAt minute precision, or days) grouped by provider/model.
+export function querySummary({ dataDir, startAt, endAt, days }, now = Date.now()) {
+  const { startMs, endMs } = resolveTrendWindow({ startAt, endAt, days }, now);
+  const ctx = openContext(dataDir, startMs, endMs, now);
+  try {
+    return summaryFromContext(ctx);
+  } finally {
+    ctx.db.close();
+  }
+}
+
+// window: trend + summary over a single DB/log scan (one enrichment pass).
+export function queryWindow({ dataDir, startAt, endAt, days, bucket, fillEmpty }, now = Date.now()) {
+  const { startMs, endMs } = resolveTrendWindow({ startAt, endAt, days }, now);
+  const ctx = openContext(dataDir, startMs, endMs, now);
+  try {
+    const trend = buildTrendFromContext(ctx, { startMs, endMs, bucket, fillEmpty, now });
+    const summary = summaryFromContext(ctx);
+    return { trend, summary };
+  } finally {
+    ctx.db.close();
+  }
+}
+
+// calls: the per-call ledger for the window, newest first (调用日志).
+export function queryCalls({ dataDir, startAt, endAt, days, limit }, now = Date.now()) {
+  const lim = clampInt(limit, 1, 1000, 200);
+  const { startMs, endMs } = resolveTrendWindow({ startAt, endAt, days: days ?? 1 }, now);
+  const ctx = openContext(dataDir, startMs, endMs, now);
+  try {
+    const calls = ctx.ledger
+      .slice()
+      .sort((a, b) => b.ts - a.ts)
+      .slice(0, lim)
+      .map((c) => ({
+        ts: c.ts,
+        time: new Date(c.ts).toISOString(),
+        sessionId: c.sessionId,
+        agentName: c.agentName,
+        turnId: c.turnId,
+        provider: c.provider,
+        providerName: c.providerName,
+        model: c.model,
+        modelName: c.modelName,
+        custom: c.custom,
+        inputTokens: c.input_tokens,
+        outputTokens: c.output_tokens,
+        reasoningTokens: c.reasoning_tokens,
+        cacheReadTokens: c.cache_read_tokens,
+        cacheWriteTokens: c.cache_write_tokens,
+        totalTokens:
+          c.input_tokens + c.output_tokens + c.reasoning_tokens + c.cache_read_tokens + c.cache_write_tokens,
+        decodeMs: c.decodeMs,
+        requestMs: c.requestMs,
+        status: c.status,
+        finishReason: c.finishReason,
+        outputRate: c.rate,
+      }));
+    return {
+      window: ctx.meta.window,
+      calls,
+      totalCalls: ctx.ledger.length,
+      rateMeasured: ctx.meta.rateMeasured,
+      notes: NOTES,
+      meta: ctx.meta,
+    };
+  } finally {
+    ctx.db.close();
+  }
+}
+
+// sessions: per-session aggregation over the window, newest activity first.
+// outputRate = mean of the session's measured per-call decode rates.
+export function querySessions({ dataDir, startAt, endAt, days, limit }, now = Date.now()) {
+  const lim = clampInt(limit, 1, 50, 10);
+  const { startMs, endMs } = resolveTrendWindow({ startAt, endAt, days: days ?? 30 }, now);
+  const ctx = openContext(dataDir, startMs, endMs, now);
+  const bySession = new Map();
+  try {
+    for (const call of ctx.ledger) {
+      if (!bySession.has(call.sessionId)) {
+        bySession.set(call.sessionId, {
+          total: emptyMetrics(),
+          firstTs: call.ts,
+          lastTs: call.ts,
+          groups: new Map(),
+          calls: [],
+          agentName: call.agentName || null,
+        });
+      }
+      const s = bySession.get(call.sessionId);
+      s.firstTs = Math.min(s.firstTs, call.ts);
+      s.lastTs = Math.max(s.lastTs, call.ts);
+      addRow(s.total, call);
+      s.calls.push(call);
+      const gk = `${call.provider}|${call.model}`;
+      if (!s.groups.has(gk)) {
+        s.groups.set(gk, {
+          provider: call.provider,
+          providerName: call.providerName,
+          model: call.model,
+          modelName: call.modelName,
+          custom: call.custom,
+          metrics: emptyMetrics(),
+          callList: [],
+        });
+      }
+      const g = s.groups.get(gk);
+      addRow(g.metrics, call);
+      g.callList.push(call);
+    }
+    const titles = new Map();
+    try {
+      for (const r of ctx.db.prepare('SELECT session_id, title, agent_name, workspace_dir FROM local_runtime_sessions').all()) {
+        titles.set(r.session_id, r);
+      }
+    } catch {
+      // titles optional
+    }
+    const sessions = [...bySession.entries()]
+      .map(([sessionId, s]) => {
+        const info = titles.get(sessionId);
+        const models = sortGroups(
+          [...s.groups.values()].map((g) => ({
+            ...g,
+            ...finalize(g.metrics),
+            outputRate: meanCallRate(g.callList),
+            metrics: undefined,
+            callList: undefined,
+          })),
+        );
+        const metrics = finalize(s.total);
+        return {
+          sessionId,
+          title: info?.title || null,
+          agentName: s.agentName || info?.agent_name || null,
+          workspaceDir: info?.workspace_dir || null,
+          firstActivity: new Date(s.firstTs).toISOString(),
+          lastActivity: new Date(s.lastTs).toISOString(),
+          ...metrics,
+          outputRate: meanCallRate(s.calls),
+          byModel: models,
+        };
+      })
+      .sort((a, b) => (a.lastActivity < b.lastActivity ? 1 : -1))
+      .slice(0, lim);
+    return { window: ctx.meta.window, sessions, notes: NOTES, meta: ctx.meta };
+  } finally {
+    ctx.db.close();
+  }
+}
+
+// daily: day x model aggregation over the trailing N days.
+// outputRate = mean of the day's measured per-call decode rates.
+export function queryDaily({ dataDir, days }, now = Date.now()) {
+  const n = clampInt(days, 1, 90, 7);
+  const { startMs, endMs } = resolveTrendWindow({ days: n }, now);
+  const ctx = openContext(dataDir, startMs, endMs, now);
+  const byDay = new Map();
+  try {
+    for (const call of ctx.ledger) {
+      const key = dayKey(call.ts);
+      if (!byDay.has(key)) byDay.set(key, { total: emptyMetrics(), groups: new Map(), calls: [] });
+      const day = byDay.get(key);
+      addRow(day.total, call);
+      day.calls.push(call);
+      const gk = `${call.provider}|${call.model}`;
+      if (!day.groups.has(gk)) {
+        day.groups.set(gk, {
+          provider: call.provider,
+          providerName: call.providerName,
+          model: call.model,
+          modelName: call.modelName,
+          custom: call.custom,
+          metrics: emptyMetrics(),
+          callList: [],
+        });
+      }
+      const g = day.groups.get(gk);
+      addRow(g.metrics, call);
+      g.callList.push(call);
+    }
+    const daysOut = [...byDay.entries()]
+      .sort(([a], [b]) => (a < b ? -1 : 1))
+      .map(([day, v]) => {
+        const total = finalize(v.total);
+        return {
+          day,
+          total: { ...total, outputRate: meanCallRate(v.calls) },
+          byModel: sortGroups(
+            [...v.groups.values()].map((g) => ({
+              ...g,
+              ...finalize(g.metrics),
+              outputRate: meanCallRate(g.callList),
+              metrics: undefined,
+              callList: undefined,
+            })),
+          ),
+        };
+      });
+    return { window: ctx.meta.window, days: daysOut, notes: NOTES, meta: ctx.meta };
+  } finally {
+    ctx.db.close();
+  }
+}
+
+// snapshots: long-term archive written by the token-meter SessionEnd hook.
+// 快照只保存了归档总量，没有逐次调用数据；outputRate 仍为归档口径
+//（输出 tokens ÷ 会话起止时长），客户端单元格 tooltip 会标注。
+export function querySnapshots({ dataDir, limit }) {
+  const lim = clampInt(limit, 1, 100, 20);
+  const file = snapshotFile(dataDir);
+  if (!fs.existsSync(file)) {
+    return {
+      snapshots: [],
+      totalArchived: 0,
+      hint: '还没有快照。快照由 token-meter 的 SessionEnd Hook 在每次会话结束时写入；安装该插件后，会话结束时会自动归档。',
+    };
+  }
+  const lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
+  const tail = lines.slice(-lim);
+  const snapshots = [];
+  for (const line of tail) {
+    try {
+      const s = JSON.parse(line);
+      const durSec = (Date.parse(s.endedAt) - Date.parse(s.startedAt)) / 1000;
+      const rate = Math.round((s.outputTokens || 0) / Math.max(1, Number.isNaN(durSec) ? 1 : durSec) * 100) / 100;
+      snapshots.push({ ...s, outputRate: rate });
+    } catch {
+      // skip malformed line
+    }
+  }
+  snapshots.reverse(); // newest first
+  return { snapshots, totalArchived: lines.length };
+}
