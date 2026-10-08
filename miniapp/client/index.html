@@ -775,7 +775,11 @@ function renderCalls(d) {
       ? '输出 ' + fmt.format(c.outputTokens) + ' tokens ÷ decode ' + fmt.format(c.decodeMs) + 'ms（首 token → 流结束）——与 MiniMax Code 界面同口径'
       : '该调用无 decode 计时（老数据），不参与速率统计';
     if (c.decodeMs != null && c.requestMs != null && c.decodeMs > c.requestMs) {
-      rateCell.classList.add('rate-warn'); // 流被截断，decode 计时只记到末尾
+      // decode > request 等价于首 token 早于请求发起：时间戳来自不同尝试，不计入速率聚合
+      rateCell.classList.add('rate-warn');
+      rateCell.title =
+        '该调用的两个时间戳不自洽（decode ' + fmt.format(c.decodeMs) + 'ms > request ' + fmt.format(c.requestMs) +
+        'ms，等价于首 token 早于请求发起），通常出现在工具调用续传；不计入速率聚合，逐次值仅供核查。';
     }
     tr.appendChild(rateCell);
     var reqCell = tdRate(c.requestRate);

@@ -6,7 +6,9 @@
 // 单次成功调用为 输出 tokens ÷ decode 时长（首 token 到流结束，取自 assistant
 // 消息的 usage.decode_duration_ms）；跨调用的聚合一律为 Σ输出 ÷ Σdecode 耗时
 //（时间加权），不使用逐次算术平均。没有 decode 记录的老数据不参与，避免被口径
-// 外的数值稀释。被截断的流（decode > request）不计入聚合，逐次值仍展示。
+// 外的数值稀释。decode > request 的调用不计入聚合：它等价于首 token 早于请求发起，
+// 说明两个时间戳来自不同尝试（实测仅出现在 finish=toolUse，2674 次里 6 次），
+// 其 decode 物理上不可能更长，会灌大分母。逐次值仍照常展示。
 import fs from 'node:fs';
 import {
   openDb,
@@ -34,7 +36,7 @@ export const NOTES = [
   'totalTokens = input + output + reasoning + cacheRead + cacheWrite。',
   'token 输出速率（token/s）与 MiniMax Code 界面显示的口径完全一致：单次调用的 输出 tokens ÷ decode 时长（首 token 到流结束），窗口值为 Σ输出 ÷ Σdecode 耗时（按耗时加权），并附 P50/P90 供分布参考。',
   'costUsd 为 runtime 记录值；自定义套餐/订阅类提供商通常为 0，不代表实际账单。',
-  '请求全程速率（对照列）= 输出 tokens ÷ request_duration_ms（发起请求到流结束），与输出速率的差值即首字等待与排队；个别调用在流被截断时 decode 计时只记到末尾，该值不计入输出速率统计。',
+  '请求全程速率（对照列）= 输出 tokens ÷ request_duration_ms（发起请求到流结束），与输出速率的差值即首字等待与排队；decode > request 的调用（首 token 早于请求发起、时间戳来自不同尝试）不计入输出速率聚合，逐次值仍展示。',
   'model 字段由 runtime 日志 llm_response_identifiers 按 turn 补全（按小时文件名覆盖整个窗口）；仍为 unknown 的记录早于日志保留期。',
   '对话明细：每行是一次完整对话，即用户发送一条消息后，模型经过若干次调用直至给出最终回答（turn_id 即该单位）；实时读取，无需等待会话结束。状态分为已完成（末条 finish_reason=stop）、未收尾（末条仍为 toolUse 等）与进行中（尚无 assistant 消息）。',
   '统计范围限于本机 runtime 数据库当前保留的数据；更早的历史见快照（SessionEnd Hook 归档）。',

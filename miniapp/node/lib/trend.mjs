@@ -141,7 +141,7 @@ export function buildTrendFromContext(ctx, { startMs, endMs, bucket: requestedBu
     // Accumulate the UI basis directly (Σoutput ÷ Σdecode) instead of averaging
     // per-call rates: the arithmetic mean is wrecked by the few calls the runtime
     // times with a sub-second decode span, and it disagreed with the headline KPI.
-    // The truncated-decode exclusion mirrors common.collectDecodeRates/weightedRate.
+    // The inconsistent-timing exclusion mirrors common.collectDecodeRates/weightedRate.
     if (
       typeof call.rate === 'number' &&
       !(call.decodeMs != null && call.requestMs != null && call.decodeMs > call.requestMs)

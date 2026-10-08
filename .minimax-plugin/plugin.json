@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "name": "token-meter-board",
   "displayName": "Token 用量看板",
-  "version": "1.6.0",
+  "version": "1.6.1",
   "description": "实时查看 MiniMax Code 各模型（含自定义接入模型）的 token 消耗明细、缓存命中率与输出速率（采用与 MiniMax Code 界面一致的 Σ输出 ÷ Σdecode 时间加权口径）：趋势图、逐次调用日志、每次提问的对话明细（turn 级实时统计，无需关闭会话）、会话排行、每日统计。数据来自本机 runtime 用量记录，只读。",
   "author": "HaneWari",
   "icon": "icon.png",

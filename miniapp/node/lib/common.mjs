@@ -595,9 +595,21 @@ export function buildLedgerWithDb(db, rows, enrichment, catalog) {
 // the chat UI agree, and keep the whole-request rate as the reference column
 // (their difference is time-to-first-token plus queueing).
 //
-// A truncated stream leaves a ~100ms decode timer that yields thousands of tok/s;
-// such a decode cannot exceed its own request duration, so those calls are
-// skipped for the decode aggregate (the UI filters only on "both are numbers").
+// `decode > request` is a CONSISTENCY guard, not a truncation detector.
+// decode = completed − firstToken and request = completed − requestStarted, so
+// decode > request is exactly firstTokenTime < requestStartedAt: the first
+// token "arrived" before the request was sent. That cannot happen inside one
+// coherent call — the two stamps must come from different attempts. Measured
+// on this machine it shows up only on finish_reason='toolUse', where the
+// request timer gets re-stamped on the tool-call continuation: 6 of 2674 timed
+// calls (0.22%), overshooting by 0.25–2.1s against 3.8–56s requests. Such a
+// decode is longer than physically possible and would pad the aggregate's
+// denominator, so it is skipped; the per-call value is still shown.
+//
+// NOTE this is NOT what catches the degenerate sub-second decode spans. Those
+// run ~100ms against a multi-second request, so decode < request and they pass
+// straight through — they inflate the rate instead, which is a separate known
+// property of the runtime's timing (see README).
 
 export function collectDecodeRates(calls) {
   const out = [];
