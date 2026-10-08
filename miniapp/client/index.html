@@ -696,7 +696,7 @@ function renderTrend(d) {
   $('trend-foot').textContent =
     '来源：本机 runtime 用量记录（sqlite + 日志补全）' +
     (d.unknownRows > 0 ? ' · ' + d.unknownRows + ' 条未识别模型（早于日志保留期）' : '') +
-    ' · 命中率 = cacheRead / (cacheRead + input) · 速率 = 桶内成功调用的速率均值（输出 ÷ decode），无调用的桶不绘制';
+    ' · 命中率 = cacheRead / (cacheRead + input) · 速率 = 桶内成功调用的加权速率（Σ输出 ÷ Σdecode），无调用的桶不绘制';
 
   rebuildChart(d);
 }
@@ -806,7 +806,7 @@ function renderSessions(d) {
     tr.appendChild(tdNum(s.calls));
     tr.appendChild(tdNum(s.totalTokens));
     var rateCell = tdRate(s.outputRate);
-    rateCell.title = '该会话成功调用的速率均值（输出 ÷ decode）';
+    rateCell.title = '该会话成功调用的加权速率（Σ输出 ÷ Σdecode）';
     if (s.rate && s.rate.n) {
       rateCell.appendChild(el('span', 'sub', 'Σ ' + rateFmt(s.rate.weighted) + ' · P50 ' + rateFmt(s.rate.p50)));
     }
@@ -834,7 +834,7 @@ function renderDaily(d) {
     tr.appendChild(tdNum(day.total.cacheWriteTokens));
     tr.appendChild(tdNum(day.total.totalTokens));
     var rateCell = tdRate(day.total.outputRate);
-    rateCell.title = '当天成功调用的速率均值（输出 ÷ decode）';
+    rateCell.title = '当天成功调用的加权速率（Σ输出 ÷ Σdecode）';
     if (day.total.rate && day.total.rate.n) {
       rateCell.appendChild(el('span', 'sub', 'Σ ' + rateFmt(day.total.rate.weighted) + ' · P50 ' + rateFmt(day.total.rate.p50)));
     }

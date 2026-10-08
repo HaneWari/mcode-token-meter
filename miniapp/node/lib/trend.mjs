@@ -134,11 +134,22 @@ export function buildTrendFromContext(ctx, { startMs, endMs, bucket: requestedBu
     addRow(kpi, call);
     const bStart = bucketFloor(call.ts, bucket);
     if (!buckets.has(bStart)) {
-      buckets.set(bStart, { totals: emptyMetrics(), perModel: new Map(), rates: [] });
+      buckets.set(bStart, { totals: emptyMetrics(), perModel: new Map(), rateOut: 0, rateDecodeMs: 0, rated: 0 });
     }
     const b = buckets.get(bStart);
     addRow(b.totals, call);
-    if (typeof call.rate === 'number') b.rates.push(call.rate);
+    // Accumulate the UI basis directly (Σoutput ÷ Σdecode) instead of averaging
+    // per-call rates: the arithmetic mean is wrecked by the few calls the runtime
+    // times with a sub-second decode span, and it disagreed with the headline KPI.
+    // The truncated-decode exclusion mirrors common.collectDecodeRates/weightedRate.
+    if (
+      typeof call.rate === 'number' &&
+      !(call.decodeMs != null && call.requestMs != null && call.decodeMs > call.requestMs)
+    ) {
+      b.rateOut += call.output_tokens || 0;
+      b.rateDecodeMs += call.decodeMs || 0;
+      b.rated += 1;
+    }
     const modelKey = `${call.provider}|${call.model}`;
     const key = topKeys.includes(modelKey) ? modelKey : '__other__';
     const rowTotal =
@@ -172,9 +183,10 @@ export function buildTrendFromContext(ctx, { startMs, endMs, bucket: requestedBu
     if (b) finalize(b.totals);
     for (const key of seriesKeys) tokensByModel[key].push(b?.perModel.get(key) || 0);
     cacheHitRate.push(b ? b.totals.cacheHitRate : null);
-    // mean decode rate of the calls in this bucket; null when nothing measured,
-    // so the chart leaves a gap instead of a misleading zero
-    outputRate.push(b && b.rates.length ? round2(b.rates.reduce((s, v) => s + v, 0) / b.rates.length) : null);
+    // Σoutput ÷ Σdecode for the calls in this bucket — same basis as the headline
+    // KPI and the desktop UI; null when nothing measured, so the chart leaves a gap
+    // instead of a misleading zero
+    outputRate.push(b && b.rated > 0 && b.rateDecodeMs > 0 ? round2(b.rateOut / (b.rateDecodeMs / 1000)) : null);
     calls.push(b ? b.totals.calls : 0);
     totalTokens.push(b ? b.totals.totalTokens : 0);
   }
