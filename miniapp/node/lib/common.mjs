@@ -444,33 +444,38 @@ function nearestByTime(list, ts, tolerance) {
 // Build one ledger entry per usage row, ordered by ts.
 // Message pairing is by index inside the turn (see loadAssistantCallDetails);
 // only log status lines are matched by time. rate = output_tokens / decode_duration.
+//
+// Validity is the interleaving invariant, not an absolute duration limit: a call
+// cannot finish before it starts, and cannot finish after the *next* call in the
+// same turn has already started. An absolute cap would reject legitimate long
+// calls (a 9-minute run) and push the pairing back onto nearest-neighbour matching,
+// which shifts every following row by one — so there is deliberately no upper
+// bound on how long a single call may take.
+const CLOCK_SKEW_MS = 2000;
+
 export function buildCallLedger(rows, enrichment, assistantByTurn, catalog) {
   const ledger = [];
   const cursor = new Map(); // turn key -> next assistant message index
-  for (const row of rows) {
+  for (let i = 0; i < rows.length; i += 1) {
+    const row = rows[i];
     const id = resolveRowIdentity(row, enrichment, catalog);
     const key = `${row.session_id}|${row.turn_id}`;
-    // index pairing: row[i] <-> message[i]; fall back to time only when the turn
-    // has more rows than messages (a call whose message row never landed).
+    // index pairing: row[i] <-> message[i]
     let msg = null;
     const list = row.turn_id ? assistantByTurn.get(key) : null;
     if (list && list.length) {
-      const idx = cursor.get(key) || 0;
-      const candidate = list[idx];
-      if (candidate) {
-        // the matching message must start at/after the call start and end soon after
-        const gap = candidate.ts - row.ts;
-        if (gap >= -2000 && gap <= PAIR_MAX_GAP_MS) {
-          msg = candidate;
-          cursor.set(key, idx + 1);
-        } else {
-          // sequences diverged (extra/missing row) — keep the cursor aligned by time
-          const byTime = nearestByTime(list.slice(idx), row.ts, PAIR_MAX_GAP_MS);
-          if (byTime) {
-            msg = byTime;
-            cursor.set(key, list.indexOf(byTime, idx) + 1);
-          }
-        }
+      const start = cursor.get(key) || 0;
+      const next = rows[i + 1];
+      const boundTs = next && next.turn_id === row.turn_id ? next.ts : null;
+      for (let j = start; j < list.length; j += 1) {
+        const c = list[j];
+        // ended before it started — belongs to an earlier call
+        if (c.ts < row.ts - CLOCK_SKEW_MS) continue;
+        // ended after the next call began — belongs to a later call, keep it for that row
+        if (boundTs != null && c.ts > boundTs + CLOCK_SKEW_MS) continue;
+        msg = c;
+        cursor.set(key, j + 1);
+        break;
       }
     }
     const enrichEntry = row.turn_id ? enrichment.get(row.turn_id) : null;
@@ -481,13 +486,13 @@ export function buildCallLedger(rows, enrichment, assistantByTurn, catalog) {
     const requestMs = msg ? msg.requestMs : null;
     const output = row.output_tokens || 0;
     const succeeded = status == null || status === 200; // a recorded usage row implies a completed call
-    // Official rate (matches MiniMax Code's pi_llm_tokens_per_second and CC Switch's
-    // "speed"): output tokens ÷ whole API call duration (request start → stream end).
-    const rate = succeeded && requestMs > 0 && output > 0 ? Math.round((output / (requestMs / 1000)) * 100) / 100 : null;
-    // Pure generation speed (first token → stream end), shown as the reference column;
-    // the gap between the two is time-to-first-token plus queueing.
-    const decodeRate =
-      succeeded && decodeMs > 0 && output > 0 ? Math.round((output / (decodeMs / 1000)) * 100) / 100 : null;
+    // Headline rate: identical to the desktop UI's tokens/s — output tokens ÷ decode
+    // duration (first token → stream end), the span during which tokens actually arrive.
+    const rate = succeeded && decodeMs > 0 && output > 0 ? Math.round((output / (decodeMs / 1000)) * 100) / 100 : null;
+    // Whole-request reference (output ÷ request_duration_ms); the gap between the two
+    // is time-to-first-token plus queueing.
+    const requestRate =
+      succeeded && requestMs > 0 && output > 0 ? Math.round((output / (requestMs / 1000)) * 100) / 100 : null;
     ledger.push({
       ts: row.ts,
       sessionId: row.session_id,
@@ -512,7 +517,7 @@ export function buildCallLedger(rows, enrichment, assistantByTurn, catalog) {
       finishReason: msg ? msg.finishReason : null,
       status,
       rate,
-      decodeRate,
+      requestRate,
     });
   }
   return ledger;
@@ -524,22 +529,23 @@ export function buildLedgerWithDb(db, rows, enrichment, catalog) {
 
 // --- rate aggregation ---------------------------------------------------------
 //
-// The primary rate follows MiniMax Code's own definition
-// (agent-core/pi-turn-runner/metrics.js: pi_llm_tokens_per_second = output tokens
-// ÷ whole API call duration), which CC Switch mirrors as its "speed". That number
-// is produced by the runtime itself, so it needs no trimming.
+// The rate shown by MiniMax Code's own UI lives in the desktop bundle and is
+// computed as tokensPerSecond = Σ outputTokens / Σ decodeDurationMs over a set of
+// calls — i.e. decode-based (first token → stream end) and time-weighted, NOT the
+// arithmetic mean of per-call rates. We reproduce exactly that so the board and
+// the chat UI agree, and keep the whole-request rate as the reference column
+// (their difference is time-to-first-token plus queueing).
 //
-// Only the auxiliary decode rate can be corrupt: a truncated stream leaves a
-// ~100ms timer that yields thousands of tok/s. Such calls keep their (correct)
-// primary rate and their raw decode value is simply left out of decode stats.
+// A truncated stream leaves a ~100ms decode timer that yields thousands of tok/s;
+// such a decode cannot exceed its own request duration, so those calls are
+// skipped for the decode aggregate (the UI filters only on "both are numbers").
 
 export function collectDecodeRates(calls) {
   const out = [];
   for (const c of calls) {
-    if (typeof c.decodeRate !== 'number') continue;
-    // decode longer than the request it belongs to is structurally impossible
+    if (typeof c.rate !== 'number') continue;
     if (c.decodeMs != null && c.requestMs != null && c.decodeMs > c.requestMs) continue;
-    out.push(c.decodeRate);
+    out.push(c.rate);
   }
   return out;
 }
@@ -554,12 +560,11 @@ export function percentile(sorted, p) {
   return sorted[idx];
 }
 
-function stats(values) {
+function describe(values) {
   if (!values.length) return null;
   const sorted = values.slice().sort((a, b) => a - b);
-  const sum = sorted.reduce((s, v) => s + v, 0);
   return {
-    mean: round2(sum / sorted.length),
+    mean: round2(sorted.reduce((s, v) => s + v, 0) / sorted.length),
     p50: round2(percentile(sorted, 0.5)),
     p90: round2(percentile(sorted, 0.9)),
     max: round2(sorted[sorted.length - 1]),
@@ -567,16 +572,37 @@ function stats(values) {
   };
 }
 
-// Primary rate summary over every measured call (mean + percentiles).
-export function rateStats(calls) {
-  const values = [];
-  for (const c of calls) if (typeof c.rate === 'number') values.push(c.rate);
-  return stats(values);
+// MiniMax Code UI basis: Σ output tokens ÷ Σ decode duration.
+function weightedRate(calls, msKey, rateKey) {
+  let tokens = 0;
+  let ms = 0;
+  for (const c of calls) {
+    if (typeof c[rateKey] !== 'number') continue;
+    if (msKey === 'decodeMs' && c.decodeMs != null && c.requestMs != null && c.decodeMs > c.requestMs) continue;
+    tokens += c.output_tokens || 0;
+    ms += c[msKey] || 0;
+  }
+  return ms > 0 ? round2(tokens / (ms / 1000)) : null;
 }
 
-// Mean of the primary (official) per-call rate.
+// The headline metric: identical to the desktop UI's tokens/s figure.
+export function rateStats(calls) {
+  const d = describe(collectDecodeRates(calls));
+  const weighted = weightedRate(calls, 'decodeMs', 'rate');
+  return d ? { ...d, weighted } : null;
+}
+
+// Whole-request reference rate (output ÷ request_duration_ms).
+export function requestRateStats(calls) {
+  const values = [];
+  for (const c of calls) if (typeof c.requestRate === 'number') values.push(c.requestRate);
+  const d = describe(values);
+  const weighted = weightedRate(calls, 'requestMs', 'requestRate');
+  return d ? { ...d, weighted } : null;
+}
+
 export function meanCallRate(calls) {
-  return rateStats(calls)?.mean ?? null;
+  return rateStats(calls)?.weighted ?? null;
 }
 
 export function countRatedCalls(calls) {
@@ -585,7 +611,7 @@ export function countRatedCalls(calls) {
   return n;
 }
 
-// Reference decode-rate summary (pure generation speed, first token → stream end).
+// Reference whole-request rate summary (shown alongside the headline figure).
 export function decodeRateStats(calls) {
-  return stats(collectDecodeRates(calls));
+  return requestRateStats(calls);
 }

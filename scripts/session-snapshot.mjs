@@ -123,6 +123,10 @@ try {
   }
 
   const minTs = rows[0].ts;
+  // The session may sit idle after the last call before the user closes it, so the
+  // hook's own wall clock would inflate the recorded span and dilute the rate.
+  // Anchor both ends on actual usage activity instead.
+  const maxTs = rows[rows.length - 1].ts;
   const catalog = loadCatalog(dataDir);
   // Enrichment selects hourly log files by name covering the session span —
   // cheap enough for the SessionEnd budget (files are small and hourly).
@@ -161,13 +165,17 @@ try {
   db.close();
 
   const snapshot = {
-    v: 1,
+    v: 2,
     sessionId: payload.session_id,
     reason: payload.reason ?? null,
     agentName: rows[0].agent_name || null,
     title,
     startedAt: new Date(minTs).toISOString(),
-    endedAt: new Date().toISOString(),
+    endedAt: new Date(maxTs).toISOString(),
+    // when the archive was actually written, and the idle tail before it — kept for
+    // transparency; rate and duration are computed from startedAt..endedAt
+    archivedAt: new Date().toISOString(),
+    idleAfterLastCallMs: Math.max(0, Date.now() - maxTs),
     ...finalize(total),
     byModel: sortGroups(
       [...groups.values()].map((g) => ({ ...g, ...finalize(g.metrics), metrics: undefined })),

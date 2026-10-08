@@ -30,9 +30,9 @@ import { resolveTrendWindow, buildTrendFromContext } from './trend.mjs';
 export const NOTES = [
   'cacheHitRate = cacheReadTokens / (cacheReadTokens + inputTokens)，表示提示词中命中缓存的比例；cacheWriteTokens 不计入分母。',
   'totalTokens = input + output + reasoning + cacheRead + cacheWrite。',
-  'token 输出速率（token/s）= 单次成功调用（状态 200）的 输出 tokens ÷ 请求全程时长（request_duration_ms，发起请求到流结束）——与 MiniMax Code 自身的 pi_llm_tokens_per_second 及 CC Switch 的 speed 口径一致；窗口值为这些逐次速率的均值，并同时给出 P50/P90。',
+  'token 输出速率（token/s）与 MiniMax Code 界面显示的口径完全一致：单次调用的 输出 tokens ÷ decode 时长（首 token 到流结束），窗口值为 Σ输出 ÷ Σdecode 耗时（按耗时加权），并附 P50/P90 供分布参考。',
   'costUsd 为 runtime 记录值；自定义套餐/订阅类提供商通常为 0，不代表实际账单。',
-  '纯生成速率（对照列）= 输出 tokens ÷ decode 时长（首 token 到流结束），与全程速率的差值即首字等待与排队；个别调用在流被截断时 decode 计时只记到末尾，该值不计入 decode 统计。',
+  '请求全程速率（对照列）= 输出 tokens ÷ request_duration_ms（发起请求到流结束），与输出速率的差值即首字等待与排队；个别调用在流被截断时 decode 计时只记到末尾，该值不计入输出速率统计。',
   'model 字段由 runtime 日志 llm_response_identifiers 按 turn 补全（按小时文件名覆盖整个窗口）；仍为 unknown 的记录早于日志保留期。',
   '统计范围限于本机 runtime 数据库当前保留的数据；更早的历史见快照（SessionEnd Hook 归档）。',
 ];
@@ -172,7 +172,7 @@ export function queryCalls({ dataDir, startAt, endAt, days, limit }, now = Date.
         status: c.status,
         finishReason: c.finishReason,
         outputRate: c.rate,
-        decodeRate: c.decodeRate,
+        requestRate: c.requestRate,
       }));
     return {
       window: ctx.meta.window,
@@ -326,8 +326,8 @@ export function queryDaily({ dataDir, days }, now = Date.now()) {
 }
 
 // snapshots: long-term archive written by the token-meter SessionEnd hook.
-// 快照只保存了归档总量，没有逐次调用数据；outputRate 仍为归档口径
-//（输出 tokens ÷ 会话起止时长），客户端单元格 tooltip 会标注。
+// 快照只保存了归档总量，没有逐次调用计时；速率沿用归档跨度
+// （输出 tokens ÷ startedAt..endedAt，v2 起两端均取实际用量时刻）。
 export function querySnapshots({ dataDir, limit }) {
   const lim = clampInt(limit, 1, 100, 20);
   const file = snapshotFile(dataDir);
@@ -346,7 +346,7 @@ export function querySnapshots({ dataDir, limit }) {
       const s = JSON.parse(line);
       const durSec = (Date.parse(s.endedAt) - Date.parse(s.startedAt)) / 1000;
       const rate = Math.round((s.outputTokens || 0) / Math.max(1, Number.isNaN(durSec) ? 1 : durSec) * 100) / 100;
-      snapshots.push({ ...s, outputRate: rate });
+      snapshots.push({ ...s, outputRate: rate, rateBasis: 'archive-span' });
     } catch {
       // skip malformed line
     }
