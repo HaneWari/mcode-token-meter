@@ -241,7 +241,7 @@ td .sub { display: block; font-size: 11px; color: var(--mcode-text-subtle); }
     <div class="cell"><div class="v" id="kpi-total">--</div><div class="l">总 tokens</div><div class="s" id="kpi-total-sub"></div></div>
     <div class="cell"><div class="v" id="kpi-calls">--</div><div class="l">调用次数</div><div class="s" id="kpi-calls-sub"></div></div>
     <div class="cell"><div class="v" id="kpi-hit">--</div><div class="l">缓存命中率</div><div class="s">cacheRead / (cacheRead + input)</div></div>
-    <div class="cell"><div class="v"><span id="kpi-rate">--</span><span class="unit">tok/s</span></div><div class="l">token 输出速率</div><div class="s" id="kpi-rate-sub">decode 速率均值（成功调用）</div></div>
+    <div class="cell"><div class="v"><span id="kpi-rate">--</span><span class="unit">tok/s</span></div><div class="l">token 输出速率</div><div class="s" id="kpi-rate-sub">decode 均值</div></div>
     <div class="cell"><div class="v" id="kpi-models">--</div><div class="l">活跃模型</div><div class="s" id="kpi-models-sub"></div></div>
   </section>
 
@@ -316,9 +316,9 @@ td .sub { display: block; font-size: 11px; color: var(--mcode-text-subtle); }
       <table>
         <thead><tr>
           <th>时间</th><th class="name">模型</th><th>输入</th><th>输出</th><th>推理</th>
-          <th>缓存读</th><th>缓存写</th><th>速率 (tok/s)</th><th>decode</th><th>状态码</th>
+          <th>缓存读</th><th>缓存写</th><th>速率 (tok/s)</th><th>全程 (tok/s)</th><th>decode</th><th>状态码</th>
         </tr></thead>
-        <tbody id="calls-body"><tr class="empty-row"><td colspan="10">加载中…</td></tr></tbody>
+        <tbody id="calls-body"><tr class="empty-row"><td colspan="11">加载中…</td></tr></tbody>
       </table>
     </div>
     <div class="sec-err" id="calls-err" role="alert"></div>
@@ -368,7 +368,7 @@ td .sub { display: block; font-size: 11px; color: var(--mcode-text-subtle); }
   </section>
 
   <footer class="page-foot" id="page-foot">
-    口径：总 tokens = 输入 + 输出 + 推理 + 缓存读 + 缓存写；命中率 = 缓存读 / (缓存读 + 输入)；输出速率 = 单次成功调用的 输出 tokens ÷ decode 时长（首 token 到流结束）的算术平均，decode 计时异常的调用（超过 Q3+3×IQR 上界）剔除出均值但在调用日志中以 ⚠ 标注；历史快照表为归档口径（输出 ÷ 会话起止时长）。数据来自本机 runtime 用量记录（sqlite + 日志按 turn 补全 + config.yaml 显示名），只读。
+    口径：总 tokens = 输入 + 输出 + 推理 + 缓存读 + 缓存写；命中率 = 缓存读 / (缓存读 + 输入)；输出速率 = 单次成功调用的 输出 tokens ÷ decode 时长（首 token 到流结束）的算术平均，调用日志同时给出 API 全程速率（含首字等待，CC Switch speed 口径）；历史快照表为归档口径（输出 ÷ 会话起止时长）。数据来自本机 runtime 用量记录（sqlite + 日志按 turn 补全 + config.yaml 显示名），只读。
   </footer>
 </div>
 <div class="toast" id="toast" role="status"></div>
@@ -679,10 +679,11 @@ function renderTrend(d) {
   $('kpi-calls-sub').textContent = d.series.totalTokens.length ? '峰值 ' + compact(Math.max.apply(null, d.series.totalTokens.concat([0]))) + ' / 桶' : '';
   $('kpi-hit').textContent = pct(d.kpis.cacheHitRate);
   $('kpi-rate').textContent = rateFmt(d.kpis.outputRate);
-  $('kpi-rate-sub').textContent = 'decode 均值 · ' + fmt.format(d.kpis.rateMeasured || 0) + '/' + fmt.format(d.kpis.calls) + ' 可测' +
-    (d.kpis.rateOutliers ? ' · 剔' + d.kpis.rateOutliers + '异常' : '');
-  $('kpi-rate-sub').title = 'decode 时长（首 token 到流结束）速率算术平均；' + fmt.format(d.kpis.rateMeasured || 0) + '/' + fmt.format(d.kpis.calls) + ' 次可测' +
-    (d.kpis.rateOutliers ? '，剔除 ' + d.kpis.rateOutliers + ' 次计时异常（>Q3+3×IQR）' : '');
+  $('kpi-rate-sub').textContent = 'decode 均值 · ' + fmt.format(d.kpis.rateMeasured || 0) + '/' + fmt.format(d.kpis.calls) + ' 可测';
+  $('kpi-rate-sub').title = 'decode 均值 = 输出 tokens ÷ decode 时长（首 token 到流结束）的算术平均；' +
+    fmt.format(d.kpis.rateMeasured || 0) + '/' + fmt.format(d.kpis.calls) + ' 次可测' +
+    (d.kpis.rateOutliers ? '，' + d.kpis.rateOutliers + ' 次计时残缺已剔除' : '') +
+    '。API 全程均值（含首字等待，CC Switch 口径）= ' + rateFmt(d.kpis.requestRate) + ' tok/s';
   $('kpi-models').textContent = d.kpis.activeModels;
   $('kpi-models-sub').textContent = d.models.map(function (m) { return m.modelName; }).join(' · ');
 
@@ -693,7 +694,7 @@ function renderTrend(d) {
   $('trend-foot').textContent =
     '来源：本机 runtime 用量记录（sqlite + 日志补全）' +
     (d.unknownRows > 0 ? ' · ' + d.unknownRows + ' 条未识别模型（早于日志保留期）' : '') +
-    ' · 命中率 = cacheRead / (cacheRead + input) · 速率 = 桶内成功调用的 decode 速率均值（剔除计时异常），无调用的桶不绘制';
+    ' · 命中率 = cacheRead / (cacheRead + input) · 速率 = 桶内成功调用的 decode 速率均值，无调用的桶不绘制';
 
   rebuildChart(d);
 }
@@ -746,7 +747,7 @@ function topModelNames(byModel, n) {
 /* 调用日志：逐次调用明细（当前窗口，新的在前） */
 function renderCalls(d) {
   sectionError('calls-err', null);
-  fillTable('calls-body', 10, d.calls, function (c) {
+  fillTable('calls-body', 11, d.calls, function (c) {
     var tr = el('tr');
     var time = el('td', null, fmtTimeSec(c.ts));
     time.title = c.time + ' · turn ' + (c.turnId || '--');
@@ -766,14 +767,17 @@ function renderCalls(d) {
     if (c.rateOutlier) {
       rateCell.classList.add('rate-warn');
       rateCell.appendChild(el('span', null, ' ⚠'));
-      rateCell.title = 'decode 计时异常（疑似续传/重试只记录末段），未计入速率均值 · 原始值 ' + rateFmt(c.outputRate) + ' tok/s' +
-        (c.decodeMs != null ? ' · decode ' + fmt.format(c.decodeMs) + 'ms' : '') + (c.requestMs != null ? ' · 请求全程 ' + fmt.format(c.requestMs) + 'ms' : '');
+      rateCell.title = 'decode 计时残缺（该次流被截断，只记到末尾），未计入速率均值 · 原始值 ' + rateFmt(c.outputRate) + ' tok/s · 全程速率 ' + rateFmt(c.requestRate);
     } else {
       rateCell.title = c.decodeMs != null
-        ? 'decode ' + fmt.format(c.decodeMs) + 'ms' + (c.requestMs != null ? ' · 请求全程 ' + fmt.format(c.requestMs) + 'ms' : '') + (c.finishReason ? ' · ' + c.finishReason : '')
+        ? '输出 tokens ÷ decode ' + fmt.format(c.decodeMs) + 'ms（首 token 到流结束）'
         : '该调用无 decode 计时（老数据），不参与速率均值';
     }
     tr.appendChild(rateCell);
+    var fullCell = tdRate(c.requestRate);
+    fullCell.title = '输出 tokens ÷ 请求全程 ' + (c.requestMs != null ? fmt.format(c.requestMs) + 'ms' : '--') +
+      (c.finishReason ? ' · ' + c.finishReason : '') + '（含首字等待，CC Switch speed 口径）';
+    tr.appendChild(fullCell);
     var dec = el('td', null, c.decodeMs != null ? (c.decodeMs / 1000).toFixed(1) + 's' : '--');
     tr.appendChild(dec);
     var st = el('td', c.status == null ? null : c.status === 200 ? 'hit' : 'hit low', c.status == null ? '—' : String(c.status));
@@ -922,7 +926,7 @@ async function refreshCalls() {
     renderCalls(d);
   } catch (e) {
     sectionError('calls-err', '调用日志加载失败：' + e.message);
-    fillTable('calls-body', 10, [], null, '加载失败');
+    fillTable('calls-body', 11, [], null, '加载失败');
   }
 }
 function refreshTables() {
@@ -940,7 +944,7 @@ async function refreshHealth() {
       return;
     }
     $('page-foot').textContent =
-      '口径：总 tokens = 输入 + 输出 + 推理 + 缓存读 + 缓存写；命中率 = 缓存读 / (缓存读 + 输入)；输出速率 = 单次成功调用的 输出 tokens ÷ decode 时长（首 token 到流结束）的算术平均，decode 计时异常（>Q3+3×IQR）剔除出均值并在调用日志标注 ⚠；历史快照表为归档口径（输出 ÷ 会话起止时长）。' +
+      '口径：总 tokens = 输入 + 输出 + 推理 + 缓存读 + 缓存写；命中率 = 缓存读 / (缓存读 + 输入)；输出速率 = 单次成功调用的 输出 tokens ÷ decode 时长（首 token 到流结束）的算术平均；历史快照表为归档口径（输出 ÷ 会话起止时长）。' +
       '数据源：runtime sqlite（' + fmt.format(h.usageRows == null ? 0 : h.usageRows) + ' 行，只读）· Node ' + h.runtime.node +
       (h.runtime.queryMode === 'child' ? ' · 子进程查询' : '') + '。';
   } catch (e) {

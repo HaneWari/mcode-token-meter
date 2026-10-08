@@ -364,14 +364,17 @@ export function sortGroups(groups) {
 // local_runtime_token_usage never stores the model and has no call duration.
 // Two side sources complete the picture:
 //   - assistant message rows (local_runtime_message_rows.data_json) carry
-//     usage.decode_duration_ms — the first-token-to-end decode duration — plus
-//     request_duration_ms and finish_reason;
+//     usage.decode_duration_ms (first token -> stream end) and
+//     request_duration_ms (whole API call, the CC Switch "API duration" basis);
 //   - llm_response_identifiers log lines carry response_status.
-// Matching is per (session_id, turn_id), pairing the i-th usage row with the
-// nearest assistant message / identifier line by timestamp.
+//
+// Pairing: within a turn the two sequences are strictly interleaved —
+// usage row[i].ts equals message[i-1].created_at_ms exactly, i.e. a usage row
+// is stamped when its call STARTS and the matching assistant message is written
+// when that call ENDS. So row[i] pairs with message[i] by index, never by
+// nearest timestamp (nearest-neighbour shifts by one and inflates the rate).
 
-const MESSAGE_PAIR_TOLERANCE_MS = 20000; // usage row ts and message created_at differ by ~0-2s
-const STATUS_PAIR_TOLERANCE_MS = 180000; // log lines can lag on flush/rotation
+const PAIR_MAX_GAP_MS = 5 * 60 * 1000; // call longer than this with no matching message is treated as unmeasured
 
 export function loadAssistantCallDetails(db, rows) {
   const pairSet = new Set();
@@ -422,12 +425,12 @@ export function loadAssistantCallDetails(db, rows) {
   return byTurn;
 }
 
-function nearestUnused(list, ts, tolerance) {
+function nearestByTime(list, ts, tolerance) {
   // list is sorted by ts; linear scan with an early exit is fine (per-turn lists are short)
   let best = null;
   let bestDelta = Infinity;
   for (const item of list) {
-    if (item.used || item.ts == null) continue;
+    if (item.ts == null) continue;
     const delta = Math.abs(item.ts - ts);
     if (delta < bestDelta) {
       best = item;
@@ -439,22 +442,49 @@ function nearestUnused(list, ts, tolerance) {
 }
 
 // Build one ledger entry per usage row, ordered by ts.
-// rate = output_tokens / decode_duration (successful calls with timing only).
+// Message pairing is by index inside the turn (see loadAssistantCallDetails);
+// only log status lines are matched by time. rate = output_tokens / decode_duration.
 export function buildCallLedger(rows, enrichment, assistantByTurn, catalog) {
   const ledger = [];
+  const cursor = new Map(); // turn key -> next assistant message index
   for (const row of rows) {
     const id = resolveRowIdentity(row, enrichment, catalog);
     const key = `${row.session_id}|${row.turn_id}`;
-    const msg = row.turn_id ? nearestUnused(assistantByTurn.get(key) || [], row.ts, MESSAGE_PAIR_TOLERANCE_MS) : null;
+    // index pairing: row[i] <-> message[i]; fall back to time only when the turn
+    // has more rows than messages (a call whose message row never landed).
+    let msg = null;
+    const list = row.turn_id ? assistantByTurn.get(key) : null;
+    if (list && list.length) {
+      const idx = cursor.get(key) || 0;
+      const candidate = list[idx];
+      if (candidate) {
+        // the matching message must start at/after the call start and end soon after
+        const gap = candidate.ts - row.ts;
+        if (gap >= -2000 && gap <= PAIR_MAX_GAP_MS) {
+          msg = candidate;
+          cursor.set(key, idx + 1);
+        } else {
+          // sequences diverged (extra/missing row) — keep the cursor aligned by time
+          const byTime = nearestByTime(list.slice(idx), row.ts, PAIR_MAX_GAP_MS);
+          if (byTime) {
+            msg = byTime;
+            cursor.set(key, list.indexOf(byTime, idx) + 1);
+          }
+        }
+      }
+    }
     const enrichEntry = row.turn_id ? enrichment.get(row.turn_id) : null;
-    const statusHit = enrichEntry ? nearestUnused(enrichEntry.calls, row.ts, STATUS_PAIR_TOLERANCE_MS) : null;
+    // status lines are only used to exclude failures; pick any within tolerance
+    const statusHit = enrichEntry ? nearestByTime(enrichEntry.calls, row.ts, 3 * 60 * 1000) : null;
     const status = statusHit ? statusHit.status : null;
     const decodeMs = msg ? msg.decodeMs : null;
+    const requestMs = msg ? msg.requestMs : null;
+    const output = row.output_tokens || 0;
     const succeeded = status == null || status === 200; // a recorded usage row implies a completed call
-    let rate = null;
-    if (succeeded && decodeMs != null && decodeMs > 0 && (row.output_tokens || 0) > 0) {
-      rate = Math.round((row.output_tokens / (decodeMs / 1000)) * 100) / 100;
-    }
+    const rate = succeeded && decodeMs > 0 && output > 0 ? Math.round((output / (decodeMs / 1000)) * 100) / 100 : null;
+    // CC Switch "speed" basis: output tokens ÷ whole API call duration.
+    const requestRate =
+      succeeded && requestMs > 0 && output > 0 ? Math.round((output / (requestMs / 1000)) * 100) / 100 : null;
     ledger.push({
       ts: row.ts,
       sessionId: row.session_id,
@@ -475,10 +505,11 @@ export function buildCallLedger(rows, enrichment, assistantByTurn, catalog) {
       cache_write_tokens: row.cache_write_tokens || 0,
       cost_usd: row.cost_usd || 0,
       decodeMs,
-      requestMs: msg ? msg.requestMs : null,
+      requestMs,
       finishReason: msg ? msg.finishReason : null,
       status,
       rate,
+      requestRate,
     });
   }
   return ledger;
@@ -490,33 +521,34 @@ export function buildLedgerWithDb(db, rows, enrichment, catalog) {
   return ledger;
 }
 
-// --- decode-timing anomaly handling ------------------------------------------
+// --- rate sanity check --------------------------------------------------------
 //
-// decode_duration_ms occasionally records only the final segment of a resumed
-// or retried stream, producing physically implausible rates (thousands of
-// tok/s). Rather than a hardcoded cap, mark per-call rate outliers with a
-// data-driven upper fence (Q3 + 3*IQR over the window's rated calls, active
-// only with 8+ samples) plus one hard physical rule: decode time can never
-// exceed the whole request duration. Outliers stay visible in the call log
-// but are excluded from every average.
+// With index pairing the decode rate is trustworthy for the bulk of calls
+// (median ~77 tok/s). A minority of calls carry a truncated decode timer — the
+// stream is cut early and only the final flush is timed (decode ~100ms while the
+// whole request ran for many seconds), which would otherwise print thousands of
+// tok/s. Such calls are flagged with two structural rules and excluded from
+// averages; the raw value stays visible in the call log:
+//   1. decode longer than the request it belongs to (impossible), or
+//   2. a decode rate beyond both 4x the window median and 600 tok/s, i.e. beyond
+//      any plausible text-generation throughput.
+// Only the high side is fenced: implausibly *slow* calls are real behaviour.
 
 export function markRateOutliers(ledger) {
   const rated = [];
-  for (const c of ledger) {
-    if (typeof c.rate === 'number') rated.push(c.rate);
-  }
+  for (const c of ledger) if (typeof c.rate === 'number') rated.push(c.rate);
   let fence = Infinity;
   if (rated.length >= 8) {
-    rated.sort((a, b) => a - b);
-    const q = (p) => rated[Math.min(rated.length - 1, Math.floor(rated.length * p))];
-    const q3 = q(0.75);
-    fence = q3 + 3 * (q3 - q(0.25));
+    const sorted = rated.slice().sort((a, b) => a - b);
+    const median = sorted[Math.floor(sorted.length / 2)];
+    fence = Math.max(median * 4, 600);
   }
   let outliers = 0;
   for (const c of ledger) {
     c.rateOutlier = false;
     if (typeof c.rate !== 'number') continue;
-    if ((c.decodeMs != null && c.requestMs != null && c.decodeMs > c.requestMs) || c.rate > fence) {
+    const decodeTooLong = c.decodeMs != null && c.requestMs != null && c.decodeMs > c.requestMs;
+    if (decodeTooLong || c.rate > fence) {
       c.rateOutlier = true;
       outliers += 1;
     }
@@ -547,4 +579,19 @@ export function countRatedCalls(calls) {
   let n = 0;
   for (const c of calls) if (typeof c.rate === 'number' && !c.rateOutlier) n += 1;
   return n;
+}
+
+// Mean of the whole-call rate (output ÷ request_duration_ms), the CC Switch
+// "speed" basis. Measured over every measured call regardless of the decode
+// fence, because a truncated decode timer does not affect request_duration.
+export function meanRequestCallRate(calls) {
+  let sum = 0;
+  let n = 0;
+  for (const c of calls) {
+    if (typeof c.requestRate === 'number') {
+      sum += c.requestRate;
+      n += 1;
+    }
+  }
+  return n ? Math.round((sum / n) * 100) / 100 : null;
 }

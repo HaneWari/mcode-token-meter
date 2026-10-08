@@ -15,6 +15,7 @@ import {
   finalize,
   buildLedgerWithDb,
   meanCallRate,
+  meanRequestCallRate,
   countRatedCalls,
   countRateOutliers,
 } from './common.mjs';
@@ -179,6 +180,7 @@ export function buildTrendFromContext(ctx, { startMs, endMs, bucket: requestedBu
   }
   finalize(kpi);
   kpi.outputRate = meanCallRate(ledger);
+  kpi.requestRate = meanRequestCallRate(ledger);
   kpi.rateMeasured = countRatedCalls(ledger);
   kpi.rateOutliers = countRateOutliers(ledger);
 
