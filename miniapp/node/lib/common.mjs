@@ -5,8 +5,6 @@ import os from 'node:os';
 import { createRequire } from 'node:module';
 import { getFactsStore, syncFacts, assistantCallsForTurn, turnMetaForTurn } from './facts.mjs';
 
-export const PLUGIN_NAME = 'token-meter';
-
 export const SQLITE_REQUIREMENT =
   'token-meter requires Node.js 23.4+ (24 LTS recommended) so that the built-in node:sqlite module is available without flags.';
 
@@ -40,14 +38,6 @@ export function resolveDataDir(env = process.env) {
 
 export function dbPath(dataDir) {
   return path.join(dataDir, 'v2', 'sqlite', 'runtime-state.sqlite');
-}
-
-export function hookDataDir(dataDir) {
-  return path.join(dataDir, 'v2', 'plugin-data', 'hooks', PLUGIN_NAME);
-}
-
-export function snapshotFile(dataDir) {
-  return path.join(hookDataDir(dataDir), 'snapshots.jsonl');
 }
 
 // Open the runtime state database read-only.

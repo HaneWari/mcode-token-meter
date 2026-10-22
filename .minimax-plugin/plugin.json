@@ -1,21 +1,18 @@
 {
   "schemaVersion": 1,
   "name": "token-meter-board",
-  "displayName": "Token 用量看板",
-  "version": "1.7.2",
-  "description": "实时查看 MiniMax Code 各模型（含自定义接入模型）的 token 消耗明细、缓存命中率与输出速率（采用与 MiniMax Code 界面一致的 Σ输出 ÷ Σdecode 时间加权口径）：趋势图、逐次调用日志、每次提问的对话明细（turn 级实时统计，无需关闭会话）、会话排行、每日统计。数据来自本机 runtime 用量记录，只读。",
+  "displayName": "Token 仪表盘",
+  "version": "1.8.0",
+  "description": "本机 MiniMax Code 的实时 token 用量仪表盘：用量趋势、逐次调用台账、每轮对话明细、缓存命中率与输出速率。输出速率采用与产品内界面一致的 Σ输出 ÷ Σdecode 时间加权口径，并附 P50/P90 供分布参考。全程零依赖、只读本机数据、不出网。",
   "author": "HaneWari",
   "icon": "icon.png",
-  "category": "Other",
+  "category": "Code",
   "exampleQueries": [
-    "打开 Token 用量看板",
+    "打开 Token 仪表盘",
     "查看我的模型用量趋势",
     "哪个自定义模型的缓存命中率最高？"
   ],
   "apps": [],
   "mcpServers": [],
-  "skills": [],
-  "hooks": [
-    "hooks/hooks.json"
-  ]
+  "skills": []
 }

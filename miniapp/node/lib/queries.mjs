@@ -28,7 +28,6 @@ import {
   sortGroups,
   dayKey,
   clampInt,
-  snapshotFile,
 } from './common.mjs';
 import { resolveTrendWindow, buildTrendFromContext } from './trend.mjs';
 
@@ -442,34 +441,4 @@ export function queryDaily({ dataDir, days }, now = Date.now()) {
       };
     });
   return { window: ctx.meta.window, days: daysOut, notes: NOTES, meta: ctx.meta };
-}
-
-// snapshots: long-term archive written by the token-meter SessionEnd hook.
-// 快照只保存了归档总量，没有逐次调用计时；速率沿用归档跨度
-// （输出 tokens ÷ startedAt..endedAt，v2 起两端均取实际用量时刻）。
-export function querySnapshots({ dataDir, limit }) {
-  const lim = clampInt(limit, 1, 100, 20);
-  const file = snapshotFile(dataDir);
-  if (!fs.existsSync(file)) {
-    return {
-      snapshots: [],
-      totalArchived: 0,
-      hint: '还没有快照。快照由 token-meter 的 SessionEnd Hook 在每次会话结束时写入；安装该插件后，会话结束时会自动归档。',
-    };
-  }
-  const lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
-  const tail = lines.slice(-lim);
-  const snapshots = [];
-  for (const line of tail) {
-    try {
-      const s = JSON.parse(line);
-      const durSec = (Date.parse(s.endedAt) - Date.parse(s.startedAt)) / 1000;
-      const rate = Math.round((s.outputTokens || 0) / Math.max(1, Number.isNaN(durSec) ? 1 : durSec) * 100) / 100;
-      snapshots.push({ ...s, outputRate: rate, rateBasis: 'archive-span' });
-    } catch {
-      // skip malformed line
-    }
-  }
-  snapshots.reverse(); // newest first
-  return { snapshots, totalArchived: lines.length };
 }

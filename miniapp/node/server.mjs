@@ -9,7 +9,7 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { resolveDataDir, openDb, factsStore } from './lib/common.mjs';
 import { resolveTrendWindow, buildTrendResult } from './lib/trend.mjs';
-import { querySummary, querySessions, queryDaily, querySnapshots, queryWindow, queryCalls, queryTurns } from './lib/queries.mjs';
+import { querySummary, querySessions, queryDaily, queryWindow, queryCalls, queryTurns } from './lib/queries.mjs';
 
 /** @typedef {import('./miniapp-api.js').MiniAppContext} MiniAppContext */
 /** @typedef {import('./miniapp-api.js').MiniAppLifecycle} MiniAppLifecycle */
@@ -61,7 +61,6 @@ export async function start(context) {
     summary: (p) => querySummary({ dataDir, ...p }),
     sessions: (p) => querySessions({ dataDir, ...p }),
     daily: (p) => queryDaily({ dataDir, ...p }),
-    snapshots: (p) => querySnapshots({ dataDir, ...p }),
     calls: (p) => queryCalls({ dataDir, ...p }),
     turns: (p) => queryTurns({ dataDir, ...p }),
   };
@@ -193,7 +192,6 @@ export async function start(context) {
     '/api/summary': 'summary',
     '/api/sessions': 'sessions',
     '/api/daily': 'daily',
-    '/api/snapshots': 'snapshots',
     '/api/calls': 'calls',
     '/api/turns': 'turns',
   };
