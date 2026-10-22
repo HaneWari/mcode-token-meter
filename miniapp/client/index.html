@@ -114,6 +114,24 @@ select:focus-visible, input:focus-visible {
 .autor input { accent-color: var(--mcode-accent); }
 .err-line { width: 100%; font-size: 12px; color: var(--mcode-danger); display: none; }
 
+/* 更新中标记：数据留在屏幕上，只提示正在取新值，不做整块清空 */
+.busy-flag {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 12px; color: var(--mcode-text-muted);
+  padding: 4px 9px; border-radius: 999px;
+  background: var(--mcode-surface-muted); border: 1px solid var(--mcode-border);
+}
+.busy-flag[hidden] { display: none; }
+.busy-flag .dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--mcode-accent);
+  animation: busy-pulse 1s ease-in-out infinite;
+}
+@keyframes busy-pulse { 0%, 100% { opacity: .25; } 50% { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) { .busy-flag .dot { animation: none; } }
+/* 正在取新值的区块轻微降透明度，旧数据仍然可读 */
+.stale { opacity: .72; transition: opacity .18s ease; }
+
 /* KPI strip */
 .kpi-strip {
   display: grid; grid-template-columns: repeat(5, 1fr);
@@ -239,6 +257,7 @@ td .sub { display: block; font-size: 11px; color: var(--mcode-text-subtle); }
       <button data-preset="1h">近 1 小时</button><button data-preset="today">今天</button><button data-preset="7d">近 7 天</button><button data-preset="30d">近 30 天</button>
     </div>
     <button class="btn-primary" id="win-apply">应用</button>
+    <span class="busy-flag" id="busy-flag" hidden><span class="dot"></span><span id="busy-text">更新中…</span></span>
     <div class="err-line" id="win-err" role="alert"></div>
   </section>
 
@@ -253,7 +272,7 @@ td .sub { display: block; font-size: 11px; color: var(--mcode-text-subtle); }
   <div class="bar-block" id="compose" aria-label="token 构成"></div>
   <div class="bar-block" id="share" aria-label="模型占比"></div>
 
-  <section class="card" aria-label="用量趋势">
+  <section class="card" aria-label="用量趋势" data-section="trend">
     <div class="card-head">
       <div class="card-title">用量构成</div>
       <div class="chip-group" role="group" aria-label="折线开关">
@@ -271,7 +290,7 @@ td .sub { display: block; font-size: 11px; color: var(--mcode-text-subtle); }
     </div>
   </section>
 
-  <section class="card" aria-label="模型明细">
+  <section class="card" aria-label="模型明细" data-section="models">
     <div class="card-head">
       <div class="card-title">模型明细（当前窗口）</div>
     </div>
@@ -287,7 +306,7 @@ td .sub { display: block; font-size: 11px; color: var(--mcode-text-subtle); }
     <div class="sec-err" id="models-err" role="alert"></div>
   </section>
 
-  <section class="card" aria-label="每日统计">
+  <section class="card" aria-label="每日统计" data-section="daily">
     <div class="card-head">
       <div class="card-title">每日统计</div>
       <div class="card-tools">
@@ -308,7 +327,7 @@ td .sub { display: block; font-size: 11px; color: var(--mcode-text-subtle); }
     <div class="sec-err" id="daily-err" role="alert"></div>
   </section>
 
-  <section class="card" aria-label="调用日志">
+  <section class="card" aria-label="调用日志" data-section="calls">
     <div class="card-head">
       <div class="card-title">调用日志（当前窗口）</div>
       <div class="card-tools">
@@ -329,7 +348,7 @@ td .sub { display: block; font-size: 11px; color: var(--mcode-text-subtle); }
     <div class="sec-err" id="calls-err" role="alert"></div>
   </section>
 
-  <section class="card" aria-label="对话明细">
+  <section class="card" aria-label="对话明细" data-section="turns">
     <div class="card-head">
       <div class="card-title">对话明细（每次提问）</div>
       <div class="card-tools">
@@ -349,7 +368,7 @@ td .sub { display: block; font-size: 11px; color: var(--mcode-text-subtle); }
     <div class="sec-err" id="turn-err" role="alert"></div>
   </section>
 
-  <section class="card" aria-label="会话用量排行">
+  <section class="card" aria-label="会话用量排行" data-section="sessions">
     <div class="card-head">
       <div class="card-title">会话用量排行</div>
       <div class="card-tools">
@@ -926,6 +945,27 @@ function windowQuery() {
   return '?startAt=' + encodeURIComponent(toInput(w.start)) + '&endAt=' + encodeURIComponent(toInput(w.end));
 }
 
+/* ---------- refresh plumbing ----------
+   A slow answer for an old window must never overwrite a newer one, so every
+   section keeps a ticket number and drops responses that are no longer the
+   latest request. The data already on screen stays visible while the new
+   values are fetched — the section is only dimmed and flagged as updating. */
+var reqTicket = { window: 0, turns: 0, calls: 0, sessions: 0, daily: 0 };
+var busyCount = 0;
+
+function nextTicket(name) { reqTicket[name] += 1; return reqTicket[name]; }
+function isCurrent(name, ticket) { return reqTicket[name] === ticket; }
+
+function setBusy(on) {
+  busyCount += on ? 1 : -1;
+  if (busyCount < 0) busyCount = 0;
+  $('busy-flag').hidden = busyCount === 0;
+}
+function markStale(sectionId, on) {
+  var card = document.querySelector('[data-section="' + sectionId + '"]');
+  if (card) card.classList.toggle('stale', !!on);
+}
+
 async function refreshWindowSections() {
   if (followNow) $('win-end').value = toInput(Date.now());
   var w = windowMs();
@@ -936,62 +976,107 @@ async function refreshWindowSections() {
   showWinError(null);
   $('win-apply').disabled = true;
   if (!trendData) setChartState('加载中…');
+  var ticket = nextTicket('window');
+  setBusy(true);
+  markStale('trend', true);
+  markStale('models', true);
   try {
     var d = await api('/api/window' + windowQuery() + '&bucket=auto');
+    if (!isCurrent('window', ticket)) return; // a newer window already won
     renderTrend(d.trend);
     renderModels(d.summary);
   } catch (e) {
+    if (!isCurrent('window', ticket)) return;
     if (!trendData) setChartState('加载失败');
     showWinError('数据加载失败：' + e.message);
     sectionError('models-err', '模型明细加载失败：' + e.message);
   } finally {
-    $('win-apply').disabled = false;
+    if (isCurrent('window', ticket)) {
+      $('win-apply').disabled = false;
+      markStale('trend', false);
+      markStale('models', false);
+    }
+    setBusy(false);
   }
 }
 
 async function refreshSessions() {
+  var ticket = nextTicket('sessions');
+  setBusy(true);
+  markStale('sessions', true);
   try {
     var d = await api('/api/sessions?days=' + $('sess-days').value + '&limit=' + $('sess-limit').value);
+    if (!isCurrent('sessions', ticket)) return;
     renderSessions(d);
   } catch (e) {
+    if (!isCurrent('sessions', ticket)) return;
     sectionError('sess-err', '会话排行加载失败：' + e.message);
     fillTable('sess-body', 8, [], null, '加载失败');
+  } finally {
+    if (isCurrent('sessions', ticket)) markStale('sessions', false);
+    setBusy(false);
   }
 }
 async function refreshDaily() {
+  var ticket = nextTicket('daily');
+  setBusy(true);
+  markStale('daily', true);
   try {
     var d = await api('/api/daily?days=' + $('daily-days').value);
+    if (!isCurrent('daily', ticket)) return;
     renderDaily(d);
   } catch (e) {
+    if (!isCurrent('daily', ticket)) return;
     sectionError('daily-err', '每日统计加载失败：' + e.message);
     fillTable('daily-body', 11, [], null, '加载失败');
+  } finally {
+    if (isCurrent('daily', ticket)) markStale('daily', false);
+    setBusy(false);
   }
 }
 async function refreshTurns() {
   var w = windowMs();
   if (!Number.isFinite(w.start) || !Number.isFinite(w.end) || w.end <= w.start) return; // 窗口非法时由趋势区报错
+  var ticket = nextTicket('turns');
+  setBusy(true);
+  markStale('turns', true);
   try {
     var d = await api('/api/turns' + windowQuery() + '&limit=' + $('turn-limit').value);
+    if (!isCurrent('turns', ticket)) return;
     renderTurns(d);
   } catch (e) {
+    if (!isCurrent('turns', ticket)) return;
     sectionError('turn-err', '对话明细加载失败：' + e.message);
     fillTable('turn-body', 11, [], null, '加载失败');
+  } finally {
+    if (isCurrent('turns', ticket)) markStale('turns', false);
+    setBusy(false);
   }
 }
 async function refreshCalls() {
   var w = windowMs();
   if (!Number.isFinite(w.start) || !Number.isFinite(w.end) || w.end <= w.start) return; // 窗口非法时由趋势区报错
+  var ticket = nextTicket('calls');
+  setBusy(true);
+  markStale('calls', true);
   try {
     var d = await api('/api/calls' + windowQuery() + '&limit=' + $('calls-limit').value);
+    if (!isCurrent('calls', ticket)) return;
     renderCalls(d);
   } catch (e) {
+    if (!isCurrent('calls', ticket)) return;
     sectionError('calls-err', '调用日志加载失败：' + e.message);
     fillTable('calls-body', 12, [], null, '加载失败');
+  } finally {
+    if (isCurrent('calls', ticket)) markStale('calls', false);
+    setBusy(false);
   }
 }
-function refreshTables() {
-  refreshSessions();
-  refreshDaily();
+
+// The two tables that follow the main query window. The session ranking and
+// the daily table have their own window pickers, so they are not re-fetched
+// when only the main window changes.
+function refreshWindowTables() {
   refreshTurns();
   refreshCalls();
 }
@@ -1013,20 +1098,28 @@ async function refreshHealth() {
 }
 
 function refreshAll() {
-  refreshWindowSections();
-  refreshTables();
+  return Promise.all([
+    refreshWindowSections(),
+    refreshSessions(),
+    refreshDaily(),
+    refreshTurns(),
+    refreshCalls(),
+  ]);
 }
 
 /* ---------- presets + follow-now + 5s auto refresh ---------- */
 var autoTimer = null;
+var autoBusy = false;
 function armAutoRefresh() {
   if (autoTimer) clearInterval(autoTimer);
   autoTimer = null;
   if ($('autor').checked) {
     autoTimer = setInterval(function () {
+      // 上一轮还没跑完就跳过这一拍，避免请求叠加
+      if (autoBusy) return;
+      autoBusy = true;
       if (activePreset) anchorPreset(activePreset); // rolling window re-anchor
-      refreshWindowSections();
-      refreshTables(); // 所有表格同节拍 5s 刷新
+      refreshAll().finally(function () { autoBusy = false; });
     }, 5000);
   }
 }
@@ -1048,7 +1141,7 @@ function applyPreset(name) {
   syncFollowUI();
   anchorPreset(name);
   refreshWindowSections();
-  refreshCalls();
+  refreshWindowTables();
 }
 
 document.querySelectorAll('.seg button').forEach(function (btn) {
@@ -1063,7 +1156,7 @@ $('win-apply').addEventListener('click', function () {
   activePreset = null;
   document.querySelectorAll('.seg button').forEach(function (b) { b.classList.remove('on'); });
   refreshWindowSections();
-  refreshCalls();
+  refreshWindowTables();
 });
 $('win-follow').addEventListener('change', function () {
   followNow = $('win-follow').checked;
@@ -1073,7 +1166,7 @@ $('win-follow').addEventListener('change', function () {
     document.querySelectorAll('.seg button').forEach(function (b) { b.classList.remove('on'); });
   }
   syncFollowUI();
-  if (followNow) { refreshWindowSections(); refreshCalls(); }
+  if (followNow) { refreshWindowSections(); refreshWindowTables(); }
 });
 $('refresh-all').addEventListener('click', refreshAll);
 $('sess-days').addEventListener('change', refreshSessions);
@@ -1123,8 +1216,9 @@ applyTheme();
 syncFollowUI();
 document.querySelector('.seg button[data-preset="today"]').classList.add('on');
 refreshHealth();
-applyPreset('today');
-refreshTables();
+applyPreset('today');   // 趋势 + 模型明细 + 对话明细 + 调用日志
+refreshSessions();      // 会话排行与每日统计有各自的窗口选择器
+refreshDaily();
 armAutoRefresh();
 </script>
 </body>

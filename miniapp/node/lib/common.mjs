@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { createRequire } from 'node:module';
+import { getFactsStore, syncFacts, assistantCallsForTurn, turnMetaForTurn } from './facts.mjs';
 
 export const PLUGIN_NAME = 'token-meter';
 
@@ -67,6 +68,12 @@ export function openDb(dataDir) {
   }
 }
 
+// The message fact store is shared per runtime database, so every query in this
+// process reuses the same extraction instead of re-parsing the message table.
+export function factsStore(dataDir) {
+  return getFactsStore(dataDir);
+}
+
 // Query raw usage rows in [startMs, endMs] ascending by ts.
 export function queryUsageRows(db, startMs, endMs) {
   return db
@@ -129,11 +136,30 @@ function unquote(value) {
 // Minimal line-based YAML reader targeting only the provider sections we need.
 // Returns { providers: Map<id, {name, kind}>, modelNames: Map<'providerId/modelId', name>,
 //           modelToProvider: Map<modelId, providerId> }.
+//
+// The catalog is read from the same config.yaml on every query, so it is cached
+// per (mtime, size) and only re-parsed when the file actually changes.
+let catalogCache = null;
+
 export function loadCatalog(dataDir) {
+  const file = path.join(dataDir, 'config.yaml');
+  let stamp = null;
+  try {
+    const st = fs.statSync(file);
+    stamp = `${st.mtimeMs}:${st.size}`;
+  } catch {
+    stamp = null;
+  }
+  if (catalogCache && catalogCache.stamp === stamp) return catalogCache.catalog;
+  const catalog = parseCatalog(file);
+  catalogCache = { stamp, catalog };
+  return catalog;
+}
+
+function parseCatalog(file) {
   const providers = new Map();
   const modelNames = new Map();
   const modelToProvider = new Map();
-  const file = path.join(dataDir, 'config.yaml');
   let text;
   try {
     text = fs.readFileSync(file, 'utf8');
@@ -221,6 +247,63 @@ export function loadCatalog(dataDir) {
 
 const LOG_LINE_TS = /^\[(\d{2}):(\d{2}):(\d{2})\.(\d{3})\]/;
 
+// Log files rotate hourly and are append-only, so a file whose (mtime, size) is
+// unchanged still holds exactly the same records. Caching per file means a
+// window switch re-reads only the hour currently being written instead of
+// rescanning every hour of the window — that was ≈750 ms on a one-week window.
+const logFileCache = new Map(); // absolute path -> { stamp, records }
+const LOG_FILE_CACHE_MAX = 256; // bound the memory of a long-running runtime
+
+function stampOf(st) {
+  return `${st.mtimeMs}:${st.size}`;
+}
+
+function parseLogFile(file, maxBytesPerFile) {
+  const records = [];
+  let text;
+  try {
+    const st = fs.statSync(file);
+    const fd = fs.openSync(file, 'r');
+    try {
+      const start = st.size > maxBytesPerFile ? st.size - maxBytesPerFile : 0;
+      const buf = Buffer.alloc(st.size - start);
+      fs.readSync(fd, buf, 0, buf.length, start);
+      text = buf.toString('utf8');
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return null;
+  }
+  for (const line of text.split('\n')) {
+    const i = line.indexOf('llm_response_identifiers ');
+    if (i < 0) continue;
+    const j = line.indexOf('{', i);
+    if (j < 0) continue;
+    let obj;
+    try {
+      obj = JSON.parse(line.slice(j));
+    } catch {
+      continue; // partial tail line or unexpected shape
+    }
+    if (!obj || !obj.turn_id) continue;
+    const tm = line.slice(0, i).match(LOG_LINE_TS);
+    // Seconds since local midnight. The capture groups are strings, so they
+    // must be coerced explicitly — `a + tm[3]` would concatenate instead of add.
+    const ts = tm
+      ? Number(tm[1]) * 3600 + Number(tm[2]) * 60 + Number(tm[3]) + Number(tm[4]) / 1000
+      : null;
+    records.push({
+      turn_id: obj.turn_id,
+      provider: obj.provider || null,
+      model: obj.model || null,
+      status: typeof obj.response_status === 'number' ? obj.response_status : null,
+      ts,
+    });
+  }
+  return records;
+}
+
 export function loadTurnEnrichment(dataDir, windowStartMs, options = {}) {
   const maxBytesPerFile = options.maxBytesPerFile ?? 12 * 1024 * 1024;
   const now = options.now ?? Date.now();
@@ -241,44 +324,37 @@ export function loadTurnEnrichment(dataDir, windowStartMs, options = {}) {
     const fileHourMs = new Date(+m[1], +m[2] - 1, +m[3], +m[4]).getTime();
     if (fileHourMs < firstHour.getTime() || fileHourMs > now + 3600000) continue;
     const p = path.join(dir, name);
-    let text;
+    let stamp = null;
     try {
-      const st = fs.statSync(p);
-      const fd = fs.openSync(p, 'r');
-      try {
-        const start = st.size > maxBytesPerFile ? st.size - maxBytesPerFile : 0;
-        const buf = Buffer.alloc(st.size - start);
-        fs.readSync(fd, buf, 0, buf.length, start);
-        text = buf.toString('utf8');
-      } finally {
-        fs.closeSync(fd);
-      }
+      stamp = stampOf(fs.statSync(p));
     } catch {
       continue;
     }
-    filesScanned += 1;
-    const dayBase = new Date(+m[1], +m[2] - 1, +m[3]).getTime();
-    for (const line of text.split('\n')) {
-      const i = line.indexOf('llm_response_identifiers ');
-      if (i < 0) continue;
-      const j = line.indexOf('{', i);
-      if (j < 0) continue;
-      let obj;
-      try {
-        obj = JSON.parse(line.slice(j));
-      } catch {
-        continue; // partial tail line or unexpected shape
+    const cached = logFileCache.get(p);
+    let records;
+    if (cached && cached.stamp === stamp) {
+      records = cached.records;
+    } else {
+      const parsed = parseLogFile(p, maxBytesPerFile);
+      if (!parsed) continue;
+      records = parsed;
+      logFileCache.set(p, { stamp, records });
+      while (logFileCache.size > LOG_FILE_CACHE_MAX) {
+        const oldest = logFileCache.keys().next().value;
+        if (oldest === p) break;
+        logFileCache.delete(oldest);
       }
-      if (!obj || !obj.turn_id) continue;
-      const tm = line.slice(0, i).match(LOG_LINE_TS);
-      const ts = tm
-        ? dayBase + (+tm[1] * 3600 + +tm[2] * 60 + +tm[3]) * 1000 + +tm[4]
-        : null;
-      if (!map.has(obj.turn_id)) map.set(obj.turn_id, { provider: null, model: null, calls: [] });
-      const entry = map.get(obj.turn_id);
-      if (!entry.provider && obj.provider) entry.provider = obj.provider;
-      if (!entry.model && obj.model) entry.model = obj.model;
-      entry.calls.push({ ts, status: typeof obj.response_status === 'number' ? obj.response_status : null });
+    }
+    filesScanned += 1;
+    // The log line carries a wall-clock time; the file name carries the hour it
+    // belongs to, so the absolute timestamp is the file's day base plus that.
+    const dayBase = new Date(+m[1], +m[2] - 1, +m[3]).getTime();
+    for (const rec of records) {
+      if (!map.has(rec.turn_id)) map.set(rec.turn_id, { provider: null, model: null, calls: [] });
+      const entry = map.get(rec.turn_id);
+      if (!entry.provider && rec.provider) entry.provider = rec.provider;
+      if (!entry.model && rec.model) entry.model = rec.model;
+      entry.calls.push({ ts: rec.ts == null ? null : dayBase + rec.ts * 1000, status: rec.status });
     }
   }
   for (const entry of map.values()) entry.calls.sort((a, b) => (a.ts ?? 0) - (b.ts ?? 0));
@@ -373,54 +449,29 @@ export function sortGroups(groups) {
 // is stamped when its call STARTS and the matching assistant message is written
 // when that call ENDS. So row[i] pairs with message[i] by index, never by
 // nearest timestamp (nearest-neighbour shifts by one and inflates the rate).
+// There is deliberately no upper bound on how long a single call may take —
+// see the interleaving invariant in buildCallLedger.
 
-const PAIR_MAX_GAP_MS = 5 * 60 * 1000; // call longer than this with no matching message is treated as unmeasured
+// Bring the in-memory fact store up to date with the database, then hand it
+// back. Extracting the message facts is the expensive part of a query, so it
+// happens once per process and only picks up newly appended rows afterwards.
+export function syncMessageFacts(db, dataDir, options = {}) {
+  const store = factsStore(dataDir);
+  syncFacts(store, db, options);
+  return store;
+}
 
-export function loadAssistantCallDetails(db, rows) {
-  const pairSet = new Set();
-  const turnIds = new Set();
+// Assistant call timings per turn, keyed `${session_id}|${turn_id}`.
+// The facts come from the shared store, so this no longer touches the
+// message table at all.
+export function loadAssistantCallDetails(rows, store) {
+  const byTurn = new Map(); // key `${session_id}|${turn_id}` -> [{ts, decodeMs, requestMs, finishReason}]
   for (const r of rows) {
     if (!r.turn_id) continue;
-    pairSet.add(`${r.session_id}|${r.turn_id}`);
-    turnIds.add(r.turn_id);
-  }
-  const byTurn = new Map(); // key `${session_id}|${turn_id}` -> [{ts, decodeMs, requestMs, finishReason}]
-  if (!turnIds.size) return byTurn;
-  const ids = [...turnIds];
-  const CHUNK = 250;
-  for (let i = 0; i < ids.length; i += CHUNK) {
-    const slice = ids.slice(i, i + CHUNK);
-    const placeholders = slice.map(() => '?').join(',');
-    let stmt;
-    try {
-      stmt = db.prepare(
-        `SELECT session_id, turn_id, created_at_ms, data_json
-           FROM local_runtime_message_rows
-          WHERE role = 'assistant' AND turn_id IN (${placeholders})
-          ORDER BY created_at_ms`,
-      );
-    } catch {
-      return byTurn; // message table missing on older runtimes
-    }
-    for (const m of stmt.iterate(...slice)) {
-      const key = `${m.session_id}|${m.turn_id}`;
-      if (!pairSet.has(key)) continue;
-      let decodeMs = null;
-      let requestMs = null;
-      let finishReason = null;
-      try {
-        const d = JSON.parse(m.data_json);
-        if (d && d.usage) {
-          if (typeof d.usage.decode_duration_ms === 'number') decodeMs = d.usage.decode_duration_ms;
-          if (typeof d.usage.request_duration_ms === 'number') requestMs = d.usage.request_duration_ms;
-        }
-        if (d && typeof d.finish_reason === 'string') finishReason = d.finish_reason;
-      } catch {
-        // malformed message payload — timing unavailable for this call
-      }
-      if (!byTurn.has(key)) byTurn.set(key, []);
-      byTurn.get(key).push({ ts: m.created_at_ms, decodeMs, requestMs, finishReason, used: false });
-    }
+    const key = `${r.session_id}|${r.turn_id}`;
+    if (byTurn.has(key)) continue;
+    const list = assistantCallsForTurn(store, r.turn_id);
+    if (list) byTurn.set(key, list);
   }
   return byTurn;
 }
@@ -434,52 +485,12 @@ export function loadAssistantCallDetails(db, rows) {
 // no waiting for the session to close. Verified on this machine: 26 turns today,
 // 24 carrying exactly one user message, 0 carrying more than one, and all 26
 // ending on an assistant message.
-export function loadTurnMessageMeta(db, rows) {
+export function loadTurnMessageMeta(rows, store) {
   const meta = new Map(); // turn_id -> {userTs, userPreview, lastTs, finishReason, assistantCount}
-  const turnIds = new Set();
-  for (const r of rows) if (r.turn_id) turnIds.add(r.turn_id);
-  if (!turnIds.size) return meta;
-  const ids = [...turnIds];
-  const CHUNK = 250;
-  for (let i = 0; i < ids.length; i += CHUNK) {
-    const slice = ids.slice(i, i + CHUNK);
-    const placeholders = slice.map(() => '?').join(',');
-    let stmt;
-    try {
-      stmt = db.prepare(
-        `SELECT turn_id, role, created_at_ms, data_json
-           FROM local_runtime_message_rows
-          WHERE turn_id IN (${placeholders})
-          ORDER BY created_at_ms`,
-      );
-    } catch {
-      return meta; // message table missing on older runtimes
-    }
-    for (const m of stmt.iterate(...slice)) {
-      if (!m.turn_id) continue;
-      let e = meta.get(m.turn_id);
-      if (!e) {
-        e = { userTs: null, userPreview: null, lastTs: null, finishReason: null, assistantCount: 0 };
-        meta.set(m.turn_id, e);
-      }
-      if (m.created_at_ms != null && (e.lastTs == null || m.created_at_ms > e.lastTs)) e.lastTs = m.created_at_ms;
-      let d = null;
-      try {
-        d = JSON.parse(m.data_json);
-      } catch {
-        d = null;
-      }
-      if (m.role === 'user') {
-        // first user message opens the turn
-        if (e.userTs == null || m.created_at_ms < e.userTs) {
-          e.userTs = m.created_at_ms;
-          if (d && typeof d.msg_content === 'string') e.userPreview = d.msg_content;
-        }
-      } else if (m.role === 'assistant') {
-        e.assistantCount += 1;
-        if (d && typeof d.finish_reason === 'string') e.finishReason = d.finish_reason;
-      }
-    }
+  for (const r of rows) {
+    if (!r.turn_id || meta.has(r.turn_id)) continue;
+    const m = turnMetaForTurn(store, r.turn_id);
+    if (m) meta.set(r.turn_id, m);
   }
   return meta;
 }
@@ -582,8 +593,8 @@ export function buildCallLedger(rows, enrichment, assistantByTurn, catalog) {
   return ledger;
 }
 
-export function buildLedgerWithDb(db, rows, enrichment, catalog) {
-  return buildCallLedger(rows, enrichment, loadAssistantCallDetails(db, rows), catalog);
+export function buildLedgerWithDb(db, rows, enrichment, catalog, store) {
+  return buildCallLedger(rows, enrichment, loadAssistantCallDetails(rows, store), catalog);
 }
 
 // --- rate aggregation ---------------------------------------------------------

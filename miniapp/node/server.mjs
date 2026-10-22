@@ -7,7 +7,7 @@ import http from 'node:http';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { resolveDataDir, openDb } from './lib/common.mjs';
+import { resolveDataDir, openDb, factsStore } from './lib/common.mjs';
 import { resolveTrendWindow, buildTrendResult } from './lib/trend.mjs';
 import { querySummary, querySessions, queryDaily, querySnapshots, queryWindow, queryCalls, queryTurns } from './lib/queries.mjs';
 
@@ -159,6 +159,7 @@ export async function start(context) {
         db.close();
       }
     }
+    const store = factsStore(dataDir);
     return {
       ok: true,
       now: Date.now(),
@@ -170,6 +171,12 @@ export async function start(context) {
       dataDir,
       dbExists,
       usageRows,
+      facts: {
+        turns: store.byTurn.size,
+        extractedRows: store.extractedRows,
+        watermark: store.watermark,
+        lastSyncAt: store.lastSyncAt || null,
+      },
     };
   }
 

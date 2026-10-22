@@ -17,6 +17,7 @@ import {
   loadTurnEnrichment,
   buildLedgerWithDb,
   loadTurnMessageMeta,
+  syncMessageFacts,
   meanCallRate,
   rateStats,
   decodeRateStats,
@@ -43,35 +44,77 @@ export const NOTES = [
 ];
 
 // Open the DB and load the window rows plus the per-call ledger (identity,
-// decode timing, response status). Caller must close the returned db.
+// decode timing, response status).
+//
+// The derived context is cached for a few seconds, so the endpoints that
+// describe the same window — trend, call log and conversation list — share one
+// scan instead of each repeating it. That is what keeps a window switch from
+// queueing three expensive passes behind each other.
+const CONTEXT_TTL_MS = 3000;
+const contextCache = new Map();
+
+function contextKey(startMs, endMs) {
+  return `${startMs}|${endMs}`;
+}
+
+function loadSessionTitles(db) {
+  const titles = new Map();
+  try {
+    for (const r of db.prepare('SELECT session_id, title, agent_name, workspace_dir FROM local_runtime_sessions').all()) {
+      titles.set(r.session_id, r);
+    }
+  } catch {
+    // titles optional
+  }
+  return titles;
+}
+
 export function openContext(dataDir, startMs, endMs, now = Date.now()) {
+  const key = contextKey(startMs, endMs);
+  const hit = contextCache.get(key);
+  if (hit && now - hit.at < CONTEXT_TTL_MS) return hit.ctx;
+
   const { db, error } = openDb(dataDir);
   if (!db) {
     const err = new Error(error || `runtime state database unavailable under ${dataDir}`);
     err.code = 'NO_DB';
     throw err;
   }
-  const rows = queryUsageRows(db, startMs, endMs);
-  const catalog = loadCatalog(dataDir);
-  const { map: enrichment, filesScanned } = loadTurnEnrichment(dataDir, startMs, { now });
-  const ledger = buildLedgerWithDb(db, rows, enrichment, catalog);
-  const turnMeta = loadTurnMessageMeta(db, rows);
-  const meta = {
-    dataDir,
-    window: {
-      label: `${dayKey(startMs)}..${dayKey(endMs)}`,
-      start: new Date(startMs).toISOString(),
-      end: new Date(endMs).toISOString(),
-    },
-    rows: rows.length,
-    rateMeasured: countRatedCalls(ledger),
-    rate: rateStats(ledger),
-    decodeRate: decodeRateStats(ledger),
-    logFilesScanned: filesScanned,
-    turnsEnriched: enrichment.size,
-    generatedAt: new Date(now).toISOString(),
-  };
-  return { db, rows, catalog, enrichment, ledger, turnMeta, filesScanned, dataDir, meta };
+  try {
+    const rows = queryUsageRows(db, startMs, endMs);
+    const catalog = loadCatalog(dataDir);
+    const { map: enrichment, filesScanned } = loadTurnEnrichment(dataDir, startMs, { now });
+    // Message facts are extracted once per process and reused; this only picks
+    // up rows appended since the last query.
+    const store = syncMessageFacts(db, dataDir, { now });
+    const ledger = buildLedgerWithDb(db, rows, enrichment, catalog, store);
+    const turnMeta = loadTurnMessageMeta(rows, store);
+    const titles = loadSessionTitles(db);
+    const meta = {
+      dataDir,
+      window: {
+        label: `${dayKey(startMs)}..${dayKey(endMs)}`,
+        start: new Date(startMs).toISOString(),
+        end: new Date(endMs).toISOString(),
+      },
+      rows: rows.length,
+      rateMeasured: countRatedCalls(ledger),
+      rate: rateStats(ledger),
+      decodeRate: decodeRateStats(ledger),
+      logFilesScanned: filesScanned,
+      turnsEnriched: enrichment.size,
+      generatedAt: new Date(now).toISOString(),
+    };
+    const ctx = { rows, catalog, enrichment, ledger, turnMeta, titles, filesScanned, dataDir, meta };
+    contextCache.set(key, { at: now, ctx });
+    if (contextCache.size > 32) {
+      const oldest = contextCache.keys().next().value;
+      if (oldest !== key) contextCache.delete(oldest);
+    }
+    return ctx;
+  } finally {
+    db.close();
+  }
 }
 
 export function groupByModel(ctx) {
@@ -125,24 +168,16 @@ function summaryFromContext(ctx) {
 export function querySummary({ dataDir, startAt, endAt, days }, now = Date.now()) {
   const { startMs, endMs } = resolveTrendWindow({ startAt, endAt, days }, now);
   const ctx = openContext(dataDir, startMs, endMs, now);
-  try {
-    return summaryFromContext(ctx);
-  } finally {
-    ctx.db.close();
-  }
+  return summaryFromContext(ctx);
 }
 
 // window: trend + summary over a single DB/log scan (one enrichment pass).
 export function queryWindow({ dataDir, startAt, endAt, days, bucket, fillEmpty }, now = Date.now()) {
   const { startMs, endMs } = resolveTrendWindow({ startAt, endAt, days }, now);
   const ctx = openContext(dataDir, startMs, endMs, now);
-  try {
-    const trend = buildTrendFromContext(ctx, { startMs, endMs, bucket, fillEmpty, now });
-    const summary = summaryFromContext(ctx);
-    return { trend, summary };
-  } finally {
-    ctx.db.close();
-  }
+  const trend = buildTrendFromContext(ctx, { startMs, endMs, bucket, fillEmpty, now });
+  const summary = summaryFromContext(ctx);
+  return { trend, summary };
 }
 
 // calls: the per-call ledger for the window, newest first (调用日志).
@@ -150,49 +185,45 @@ export function queryCalls({ dataDir, startAt, endAt, days, limit }, now = Date.
   const lim = clampInt(limit, 1, 1000, 200);
   const { startMs, endMs } = resolveTrendWindow({ startAt, endAt, days: days ?? 1 }, now);
   const ctx = openContext(dataDir, startMs, endMs, now);
-  try {
-    const calls = ctx.ledger
-      .slice()
-      .sort((a, b) => b.ts - a.ts)
-      .slice(0, lim)
-      .map((c) => ({
-        ts: c.ts,
-        time: new Date(c.ts).toISOString(),
-        sessionId: c.sessionId,
-        agentName: c.agentName,
-        turnId: c.turnId,
-        provider: c.provider,
-        providerName: c.providerName,
-        model: c.model,
-        modelName: c.modelName,
-        custom: c.custom,
-        inputTokens: c.input_tokens,
-        outputTokens: c.output_tokens,
-        reasoningTokens: c.reasoning_tokens,
-        cacheReadTokens: c.cache_read_tokens,
-        cacheWriteTokens: c.cache_write_tokens,
-        totalTokens:
-          c.input_tokens + c.output_tokens + c.reasoning_tokens + c.cache_read_tokens + c.cache_write_tokens,
-        decodeMs: c.decodeMs,
-        requestMs: c.requestMs,
-        status: c.status,
-        finishReason: c.finishReason,
-        outputRate: c.rate,
-        requestRate: c.requestRate,
-      }));
-    return {
-      window: ctx.meta.window,
-      calls,
-      totalCalls: ctx.ledger.length,
-      rateMeasured: ctx.meta.rateMeasured,
-      rate: ctx.meta.rate,
-      decodeRate: ctx.meta.decodeRate,
-      notes: NOTES,
-      meta: ctx.meta,
-    };
-  } finally {
-    ctx.db.close();
-  }
+  const calls = ctx.ledger
+    .slice()
+    .sort((a, b) => b.ts - a.ts)
+    .slice(0, lim)
+    .map((c) => ({
+      ts: c.ts,
+      time: new Date(c.ts).toISOString(),
+      sessionId: c.sessionId,
+      agentName: c.agentName,
+      turnId: c.turnId,
+      provider: c.provider,
+      providerName: c.providerName,
+      model: c.model,
+      modelName: c.modelName,
+      custom: c.custom,
+      inputTokens: c.input_tokens,
+      outputTokens: c.output_tokens,
+      reasoningTokens: c.reasoning_tokens,
+      cacheReadTokens: c.cache_read_tokens,
+      cacheWriteTokens: c.cache_write_tokens,
+      totalTokens:
+        c.input_tokens + c.output_tokens + c.reasoning_tokens + c.cache_read_tokens + c.cache_write_tokens,
+      decodeMs: c.decodeMs,
+      requestMs: c.requestMs,
+      status: c.status,
+      finishReason: c.finishReason,
+      outputRate: c.rate,
+      requestRate: c.requestRate,
+    }));
+  return {
+    window: ctx.meta.window,
+    calls,
+    totalCalls: ctx.ledger.length,
+    rateMeasured: ctx.meta.rateMeasured,
+    rate: ctx.meta.rate,
+    decodeRate: ctx.meta.decodeRate,
+    notes: NOTES,
+    meta: ctx.meta,
+  };
 }
 
 // turns: one row per conversation — a single user message plus however many
@@ -206,104 +237,91 @@ export function queryTurns({ dataDir, startAt, endAt, days, limit }, now = Date.
   const lim = clampInt(limit, 1, 500, 120);
   const { startMs, endMs } = resolveTrendWindow({ startAt, endAt, days: days ?? 1 }, now);
   const ctx = openContext(dataDir, startMs, endMs, now);
-  try {
-    const byTurn = new Map();
-    for (const call of ctx.ledger) {
-      if (!call.turnId) continue;
-      if (!byTurn.has(call.turnId)) {
-        byTurn.set(call.turnId, {
-          total: emptyMetrics(),
-          calls: [],
-          firstTs: call.ts,
-          lastCallTs: call.ts,
-          groups: new Map(),
-          sessionId: call.sessionId,
-          agentName: call.agentName || null,
-        });
-      }
-      const t = byTurn.get(call.turnId);
-      t.firstTs = Math.min(t.firstTs, call.ts);
-      t.lastCallTs = Math.max(t.lastCallTs, call.ts);
-      addRow(t.total, call);
-      t.calls.push(call);
-      const gk = `${call.provider}|${call.model}`;
-      if (!t.groups.has(gk)) {
-        t.groups.set(gk, {
-          provider: call.provider,
-          providerName: call.providerName,
-          model: call.model,
-          modelName: call.modelName,
-          custom: call.custom,
-          metrics: emptyMetrics(),
-          callList: [],
-        });
-      }
-      const g = t.groups.get(gk);
-      addRow(g.metrics, call);
-      g.callList.push(call);
+  const byTurn = new Map();
+  for (const call of ctx.ledger) {
+    if (!call.turnId) continue;
+    if (!byTurn.has(call.turnId)) {
+      byTurn.set(call.turnId, {
+        total: emptyMetrics(),
+        calls: [],
+        firstTs: call.ts,
+        lastCallTs: call.ts,
+        groups: new Map(),
+        sessionId: call.sessionId,
+        agentName: call.agentName || null,
+      });
     }
-
-    const titles = new Map();
-    try {
-      for (const r of ctx.db.prepare('SELECT session_id, title FROM local_runtime_sessions').all()) {
-        titles.set(r.session_id, r.title || null);
-      }
-    } catch {
-      // titles optional
+    const t = byTurn.get(call.turnId);
+    t.firstTs = Math.min(t.firstTs, call.ts);
+    t.lastCallTs = Math.max(t.lastCallTs, call.ts);
+    addRow(t.total, call);
+    t.calls.push(call);
+    const gk = `${call.provider}|${call.model}`;
+    if (!t.groups.has(gk)) {
+      t.groups.set(gk, {
+        provider: call.provider,
+        providerName: call.providerName,
+        model: call.model,
+        modelName: call.modelName,
+        custom: call.custom,
+        metrics: emptyMetrics(),
+        callList: [],
+      });
     }
-
-    const turns = [...byTurn.entries()]
-      .map(([turnId, t]) => {
-        const meta = ctx.turnMeta.get(turnId) || null;
-        const startedMs = meta?.userTs != null ? Math.min(meta.userTs, t.firstTs) : t.firstTs;
-        const endedMs = meta?.lastTs != null ? meta.lastTs : null;
-        const finished = endedMs != null && (meta?.assistantCount || 0) > 0;
-        let status = 'pending';
-        if (finished) status = meta.finishReason === 'stop' ? 'completed' : 'unfinished';
-        const models = sortGroups(
-          [...t.groups.values()].map((g) => ({
-            ...g,
-            ...finalize(g.metrics),
-            outputRate: meanCallRate(g.callList),
-            metrics: undefined,
-            callList: undefined,
-          })),
-        );
-        const metrics = finalize(t.total);
-        return {
-          turnId,
-          sessionId: t.sessionId,
-          sessionTitle: titles.get(t.sessionId) || null,
-          agentName: t.agentName,
-          startedAt: new Date(startedMs).toISOString(),
-          endedAt: endedMs != null ? new Date(endedMs).toISOString() : null,
-          durationMs: endedMs != null ? endedMs - startedMs : null,
-          status,
-          finishReason: meta?.finishReason || null,
-          userPreview: meta?.userPreview || null,
-          ...metrics,
-          outputRate: meanCallRate(t.calls),
-          rate: rateStats(t.calls),
-          byModel: models,
-        };
-      })
-      .sort((a, b) => (a.startedAt < b.startedAt ? 1 : -1))
-      .slice(0, lim);
-
-    const counts = { completed: 0, unfinished: 0, pending: 0 };
-    for (const t of turns) counts[t.status] = (counts[t.status] || 0) + 1;
-
-    return {
-      window: ctx.meta.window,
-      turns,
-      totalTurns: byTurn.size,
-      counts,
-      notes: NOTES,
-      meta: ctx.meta,
-    };
-  } finally {
-    ctx.db.close();
+    const g = t.groups.get(gk);
+    addRow(g.metrics, call);
+    g.callList.push(call);
   }
+
+  const turns = [...byTurn.entries()]
+    .map(([turnId, t]) => {
+      const meta = ctx.turnMeta.get(turnId) || null;
+      const startedMs = meta?.userTs != null ? Math.min(meta.userTs, t.firstTs) : t.firstTs;
+      const endedMs = meta?.lastTs != null ? meta.lastTs : null;
+      const finished = endedMs != null && (meta?.assistantCount || 0) > 0;
+      let status = 'pending';
+      if (finished) status = meta.finishReason === 'stop' ? 'completed' : 'unfinished';
+      const models = sortGroups(
+        [...t.groups.values()].map((g) => ({
+          ...g,
+          ...finalize(g.metrics),
+          outputRate: meanCallRate(g.callList),
+          metrics: undefined,
+          callList: undefined,
+        })),
+      );
+      const metrics = finalize(t.total);
+      return {
+        turnId,
+        sessionId: t.sessionId,
+        sessionTitle: ctx.titles.get(t.sessionId)?.title || null,
+        agentName: t.agentName,
+        startedAt: new Date(startedMs).toISOString(),
+        endedAt: endedMs != null ? new Date(endedMs).toISOString() : null,
+        durationMs: endedMs != null ? endedMs - startedMs : null,
+        status,
+        finishReason: meta?.finishReason || null,
+        userPreview: meta?.userPreview || null,
+        ...metrics,
+        outputRate: meanCallRate(t.calls),
+        rate: rateStats(t.calls),
+        byModel: models,
+      };
+    })
+    .sort((a, b) => (a.startedAt < b.startedAt ? 1 : -1))
+    .slice(0, lim);
+
+  const counts = { completed: 0, unfinished: 0, pending: 0 };
+  for (const t of turns) counts[t.status] = (counts[t.status] || 0) + 1;
+
+  return {
+    window: ctx.meta.window,
+    turns,
+    totalTurns: byTurn.size,
+    counts,
+    notes: NOTES,
+    meta: ctx.meta,
+  };
 }
 
 // sessions: per-session aggregation over the window, newest activity first.
@@ -313,79 +331,67 @@ export function querySessions({ dataDir, startAt, endAt, days, limit }, now = Da
   const { startMs, endMs } = resolveTrendWindow({ startAt, endAt, days: days ?? 30 }, now);
   const ctx = openContext(dataDir, startMs, endMs, now);
   const bySession = new Map();
-  try {
-    for (const call of ctx.ledger) {
-      if (!bySession.has(call.sessionId)) {
-        bySession.set(call.sessionId, {
-          total: emptyMetrics(),
-          firstTs: call.ts,
-          lastTs: call.ts,
-          groups: new Map(),
-          calls: [],
-          agentName: call.agentName || null,
-        });
-      }
-      const s = bySession.get(call.sessionId);
-      s.firstTs = Math.min(s.firstTs, call.ts);
-      s.lastTs = Math.max(s.lastTs, call.ts);
-      addRow(s.total, call);
-      s.calls.push(call);
-      const gk = `${call.provider}|${call.model}`;
-      if (!s.groups.has(gk)) {
-        s.groups.set(gk, {
-          provider: call.provider,
-          providerName: call.providerName,
-          model: call.model,
-          modelName: call.modelName,
-          custom: call.custom,
-          metrics: emptyMetrics(),
-          callList: [],
-        });
-      }
-      const g = s.groups.get(gk);
-      addRow(g.metrics, call);
-      g.callList.push(call);
+  for (const call of ctx.ledger) {
+    if (!bySession.has(call.sessionId)) {
+      bySession.set(call.sessionId, {
+        total: emptyMetrics(),
+        firstTs: call.ts,
+        lastTs: call.ts,
+        groups: new Map(),
+        calls: [],
+        agentName: call.agentName || null,
+      });
     }
-    const titles = new Map();
-    try {
-      for (const r of ctx.db.prepare('SELECT session_id, title, agent_name, workspace_dir FROM local_runtime_sessions').all()) {
-        titles.set(r.session_id, r);
-      }
-    } catch {
-      // titles optional
+    const s = bySession.get(call.sessionId);
+    s.firstTs = Math.min(s.firstTs, call.ts);
+    s.lastTs = Math.max(s.lastTs, call.ts);
+    addRow(s.total, call);
+    s.calls.push(call);
+    const gk = `${call.provider}|${call.model}`;
+    if (!s.groups.has(gk)) {
+      s.groups.set(gk, {
+        provider: call.provider,
+        providerName: call.providerName,
+        model: call.model,
+        modelName: call.modelName,
+        custom: call.custom,
+        metrics: emptyMetrics(),
+        callList: [],
+      });
     }
-    const sessions = [...bySession.entries()]
-      .map(([sessionId, s]) => {
-        const info = titles.get(sessionId);
-        const models = sortGroups(
-          [...s.groups.values()].map((g) => ({
-            ...g,
-            ...finalize(g.metrics),
-            outputRate: meanCallRate(g.callList),
-            metrics: undefined,
-            callList: undefined,
-          })),
-        );
-        const metrics = finalize(s.total);
-        return {
-          sessionId,
-          title: info?.title || null,
-          agentName: s.agentName || info?.agent_name || null,
-          workspaceDir: info?.workspace_dir || null,
-          firstActivity: new Date(s.firstTs).toISOString(),
-          lastActivity: new Date(s.lastTs).toISOString(),
-          ...metrics,
-          outputRate: meanCallRate(s.calls),
-          rate: rateStats(s.calls),
-          byModel: models,
-        };
-      })
-      .sort((a, b) => (a.lastActivity < b.lastActivity ? 1 : -1))
-      .slice(0, lim);
-    return { window: ctx.meta.window, sessions, notes: NOTES, meta: ctx.meta };
-  } finally {
-    ctx.db.close();
+    const g = s.groups.get(gk);
+    addRow(g.metrics, call);
+    g.callList.push(call);
   }
+  const sessions = [...bySession.entries()]
+    .map(([sessionId, s]) => {
+      const info = ctx.titles.get(sessionId);
+      const models = sortGroups(
+        [...s.groups.values()].map((g) => ({
+          ...g,
+          ...finalize(g.metrics),
+          outputRate: meanCallRate(g.callList),
+          metrics: undefined,
+          callList: undefined,
+        })),
+      );
+      const metrics = finalize(s.total);
+      return {
+        sessionId,
+        title: info?.title || null,
+        agentName: s.agentName || info?.agent_name || null,
+        workspaceDir: info?.workspace_dir || null,
+        firstActivity: new Date(s.firstTs).toISOString(),
+        lastActivity: new Date(s.lastTs).toISOString(),
+        ...metrics,
+        outputRate: meanCallRate(s.calls),
+        rate: rateStats(s.calls),
+        byModel: models,
+      };
+    })
+    .sort((a, b) => (a.lastActivity < b.lastActivity ? 1 : -1))
+    .slice(0, lim);
+  return { window: ctx.meta.window, sessions, notes: NOTES, meta: ctx.meta };
 }
 
 // daily: day x model aggregation over the trailing N days.
@@ -395,51 +401,47 @@ export function queryDaily({ dataDir, days }, now = Date.now()) {
   const { startMs, endMs } = resolveTrendWindow({ days: n }, now);
   const ctx = openContext(dataDir, startMs, endMs, now);
   const byDay = new Map();
-  try {
-    for (const call of ctx.ledger) {
-      const key = dayKey(call.ts);
-      if (!byDay.has(key)) byDay.set(key, { total: emptyMetrics(), groups: new Map(), calls: [] });
-      const day = byDay.get(key);
-      addRow(day.total, call);
-      day.calls.push(call);
-      const gk = `${call.provider}|${call.model}`;
-      if (!day.groups.has(gk)) {
-        day.groups.set(gk, {
-          provider: call.provider,
-          providerName: call.providerName,
-          model: call.model,
-          modelName: call.modelName,
-          custom: call.custom,
-          metrics: emptyMetrics(),
-          callList: [],
-        });
-      }
-      const g = day.groups.get(gk);
-      addRow(g.metrics, call);
-      g.callList.push(call);
-    }
-    const daysOut = [...byDay.entries()]
-      .sort(([a], [b]) => (a < b ? -1 : 1))
-      .map(([day, v]) => {
-        const total = finalize(v.total);
-        return {
-          day,
-          total: { ...total, outputRate: meanCallRate(v.calls), rate: rateStats(v.calls) },
-          byModel: sortGroups(
-            [...v.groups.values()].map((g) => ({
-              ...g,
-              ...finalize(g.metrics),
-              outputRate: meanCallRate(g.callList),
-              metrics: undefined,
-              callList: undefined,
-            })),
-          ),
-        };
+  for (const call of ctx.ledger) {
+    const key = dayKey(call.ts);
+    if (!byDay.has(key)) byDay.set(key, { total: emptyMetrics(), groups: new Map(), calls: [] });
+    const day = byDay.get(key);
+    addRow(day.total, call);
+    day.calls.push(call);
+    const gk = `${call.provider}|${call.model}`;
+    if (!day.groups.has(gk)) {
+      day.groups.set(gk, {
+        provider: call.provider,
+        providerName: call.providerName,
+        model: call.model,
+        modelName: call.modelName,
+        custom: call.custom,
+        metrics: emptyMetrics(),
+        callList: [],
       });
-    return { window: ctx.meta.window, days: daysOut, notes: NOTES, meta: ctx.meta };
-  } finally {
-    ctx.db.close();
+    }
+    const g = day.groups.get(gk);
+    addRow(g.metrics, call);
+    g.callList.push(call);
   }
+  const daysOut = [...byDay.entries()]
+    .sort(([a], [b]) => (a < b ? -1 : 1))
+    .map(([day, v]) => {
+      const total = finalize(v.total);
+      return {
+        day,
+        total: { ...total, outputRate: meanCallRate(v.calls), rate: rateStats(v.calls) },
+        byModel: sortGroups(
+          [...v.groups.values()].map((g) => ({
+            ...g,
+            ...finalize(g.metrics),
+            outputRate: meanCallRate(g.callList),
+            metrics: undefined,
+            callList: undefined,
+          })),
+        ),
+      };
+    });
+  return { window: ctx.meta.window, days: daysOut, notes: NOTES, meta: ctx.meta };
 }
 
 // snapshots: long-term archive written by the token-meter SessionEnd hook.

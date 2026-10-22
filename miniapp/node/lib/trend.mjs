@@ -14,6 +14,7 @@ import {
   addRow,
   finalize,
   buildLedgerWithDb,
+  syncMessageFacts,
   meanCallRate,
   rateStats,
   decodeRateStats,
@@ -43,7 +44,10 @@ export function resolveTrendWindow(args, now = Date.now()) {
   const days = clampInt(args?.days, 1, 90, 7);
   const todayStart = new Date();
   todayStart.setHours(0, 0, 0, 0);
-  return { startMs: todayStart.getTime() - (days - 1) * 86400000, endMs: now };
+  // Second-level quantisation keeps a rolling window stable, so repeated
+  // queries inside the same second share one cached context instead of
+  // rebuilding the scan for every request.
+  return { startMs: todayStart.getTime() - (days - 1) * 86400000, endMs: Math.floor(now / 1000) * 1000 };
 }
 
 export function pickBucket(startMs, endMs, requested) {
@@ -231,7 +235,8 @@ export function buildTrendResult({ dataDir, startMs, endMs, bucket, fillEmpty, n
     const rows = queryUsageRows(db, startMs, endMs);
     const catalog = loadCatalog(dir);
     const { map: enrichment, filesScanned } = loadTurnEnrichment(dir, startMs, { now });
-    const ledger = buildLedgerWithDb(db, rows, enrichment, catalog);
+    const store = syncMessageFacts(db, dir, { now });
+    const ledger = buildLedgerWithDb(db, rows, enrichment, catalog, store);
     return buildTrendFromContext(
       { rows, catalog, enrichment, ledger, dataDir: dir, filesScanned },
       { startMs, endMs, bucket, fillEmpty, now },
