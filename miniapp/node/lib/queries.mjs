@@ -20,7 +20,7 @@ import {
   syncMessageFacts,
   meanCallRate,
   rateStats,
-  decodeRateStats,
+  requestRateStats,
   countRatedCalls,
   emptyMetrics,
   addRow,
@@ -39,7 +39,8 @@ export const NOTES = [
   '请求全程速率（对照列）= 输出 tokens ÷ request_duration_ms（发起请求到流结束），与输出速率的差值即首字等待与排队；decode > request 的调用（首 token 早于请求发起、时间戳来自不同尝试）不计入输出速率聚合，逐次值仍展示。',
   'model 字段由 runtime 日志 llm_response_identifiers 按 turn 补全（按小时文件名覆盖整个窗口）；仍为 unknown 的记录早于日志保留期。',
   '对话明细：每行是一次完整对话，即用户发送一条消息后，模型经过若干次调用直至给出最终回答（turn_id 即该单位）；实时读取，无需等待会话结束。状态分为已完成（末条 finish_reason=stop）、未收尾（末条仍为 toolUse 等）与进行中（尚无 assistant 消息）。',
-  '统计范围限于本机 runtime 数据库当前保留的数据；更早的历史见快照（SessionEnd Hook 归档）。',
+  '对话明细会显示该轮用户消息原文的前 200 字，仅在本机页面内展示，不出网、不落盘。',
+  '统计范围限于本机 runtime 数据库当前保留的数据；早于该保留期的历史不会出现在本表中。',
 ];
 
 // Open the DB and load the window rows plus the per-call ledger (identity,
@@ -49,11 +50,15 @@ export const NOTES = [
 // describe the same window — trend, call log and conversation list — share one
 // scan instead of each repeating it. That is what keeps a window switch from
 // queueing three expensive passes behind each other.
+//
+// The cache key includes the data directory: the same time window against two
+// different runtime databases is two different contexts, and keying on the
+// window alone would let one answer the other.
 const CONTEXT_TTL_MS = 3000;
 const contextCache = new Map();
 
-function contextKey(startMs, endMs) {
-  return `${startMs}|${endMs}`;
+function contextKey(dataDir, startMs, endMs) {
+  return `${dataDir}|${startMs}|${endMs}`;
 }
 
 function loadSessionTitles(db) {
@@ -69,7 +74,7 @@ function loadSessionTitles(db) {
 }
 
 export function openContext(dataDir, startMs, endMs, now = Date.now()) {
-  const key = contextKey(startMs, endMs);
+  const key = contextKey(dataDir, startMs, endMs);
   const hit = contextCache.get(key);
   if (hit && now - hit.at < CONTEXT_TTL_MS) return hit.ctx;
 
@@ -99,7 +104,7 @@ export function openContext(dataDir, startMs, endMs, now = Date.now()) {
       rows: rows.length,
       rateMeasured: countRatedCalls(ledger),
       rate: rateStats(ledger),
-      decodeRate: decodeRateStats(ledger),
+      requestRate: requestRateStats(ledger),
       logFilesScanned: filesScanned,
       turnsEnriched: enrichment.size,
       generatedAt: new Date(now).toISOString(),
@@ -219,7 +224,7 @@ export function queryCalls({ dataDir, startAt, endAt, days, limit }, now = Date.
     totalCalls: ctx.ledger.length,
     rateMeasured: ctx.meta.rateMeasured,
     rate: ctx.meta.rate,
-    decodeRate: ctx.meta.decodeRate,
+    requestRate: ctx.meta.requestRate,
     notes: NOTES,
     meta: ctx.meta,
   };
@@ -272,7 +277,7 @@ export function queryTurns({ dataDir, startAt, endAt, days, limit }, now = Date.
     g.callList.push(call);
   }
 
-  const turns = [...byTurn.entries()]
+  const allTurns = [...byTurn.entries()]
     .map(([turnId, t]) => {
       const meta = ctx.turnMeta.get(turnId) || null;
       const startedMs = meta?.userTs != null ? Math.min(meta.userTs, t.firstTs) : t.firstTs;
@@ -307,11 +312,16 @@ export function queryTurns({ dataDir, startAt, endAt, days, limit }, now = Date.
         byModel: models,
       };
     })
-    .sort((a, b) => (a.startedAt < b.startedAt ? 1 : -1))
-    .slice(0, lim);
+    .sort((a, b) => (a.startedAt < b.startedAt ? 1 : -1));
 
+  // The status breakdown covers EVERY turn in the window, not only the rows
+  // that survive the `limit` slice. Counting the slice instead made the
+  // headline ("本次窗口共 N 次对话（已完成 X · 未收尾 Y · 进行中 Z）") add up
+  // to less than N as soon as the window held more turns than the limit.
   const counts = { completed: 0, unfinished: 0, pending: 0 };
-  for (const t of turns) counts[t.status] = (counts[t.status] || 0) + 1;
+  for (const t of allTurns) counts[t.status] = (counts[t.status] || 0) + 1;
+
+  const turns = allTurns.slice(0, lim);
 
   return {
     window: ctx.meta.window,
@@ -324,7 +334,7 @@ export function queryTurns({ dataDir, startAt, endAt, days, limit }, now = Date.
 }
 
 // sessions: per-session aggregation over the window, newest activity first.
-// outputRate = mean of the session's measured per-call decode rates.
+// outputRate = the session's weighted decode rate (Σ output ÷ Σ decode).
 export function querySessions({ dataDir, startAt, endAt, days, limit }, now = Date.now()) {
   const lim = clampInt(limit, 1, 50, 10);
   const { startMs, endMs } = resolveTrendWindow({ startAt, endAt, days: days ?? 30 }, now);
@@ -394,7 +404,7 @@ export function querySessions({ dataDir, startAt, endAt, days, limit }, now = Da
 }
 
 // daily: day x model aggregation over the trailing N days.
-// outputRate = mean of the day's measured per-call decode rates.
+// outputRate = the day's weighted decode rate (Σ output ÷ Σ decode).
 export function queryDaily({ dataDir, days }, now = Date.now()) {
   const n = clampInt(days, 1, 90, 7);
   const { startMs, endMs } = resolveTrendWindow({ days: n }, now);

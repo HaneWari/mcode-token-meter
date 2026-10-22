@@ -694,7 +694,7 @@ function renderTrend(d) {
   $('kpi-calls-sub').textContent = d.series.totalTokens.length ? '峰值 ' + compact(Math.max.apply(null, d.series.totalTokens.concat([0]))) + ' / 桶' : '';
   $('kpi-hit').textContent = pct(d.kpis.cacheHitRate);
   var rs = d.kpis.rate || {};
-  var qs = d.kpis.decodeRate || {};
+  var qs = d.kpis.requestRate || {};
   $('kpi-rate').textContent = rateFmt(rs.weighted != null ? rs.weighted : d.kpis.outputRate);
   $('kpi-rate-sub').textContent = 'Σ输出÷Σdecode · P50 ' + rateFmt(rs.p50) + ' · N=' + fmt.format(rs.n || 0);
   $('kpi-rate-sub').title = '口径与 MiniMax Code 界面一致：输出 tokens ÷ decode 时长（首 token 到流结束），窗口内按耗时加权（Σ输出 ÷ Σ耗时）。\n' +

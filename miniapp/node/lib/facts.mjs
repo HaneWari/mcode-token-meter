@@ -29,6 +29,10 @@ import path from 'node:path';
 // Re-extract everything this often, so a rewritten row can never be missed.
 const REVERIFY_MS = 10 * 60 * 1000;
 
+// How much of the user's own message is kept for the conversation table.
+// Applied inside SQLite with substr(), so the full text (up to ~52 k chars on
+// this machine) is never carried into JS memory — only the first 200
+// characters are.
 const USER_PREVIEW_CHARS = 200;
 
 // CASE (not AND) is deliberate: SQLite evaluates CASE lazily, so the inner
@@ -41,10 +45,11 @@ function jsonField(path, kind) {
 
 const FACT_SQL = `
   SELECT id, session_id, role, turn_id, created_at_ms,
+         ${jsonField('$.usage', "= 'object'")} AS has_usage,
          ${jsonField('$.usage.decode_duration_ms', "IN ('integer','real')")} AS decode_ms,
          ${jsonField('$.usage.request_duration_ms', "IN ('integer','real')")} AS request_ms,
          ${jsonField('$.finish_reason', "= 'text'")} AS finish_reason,
-         ${jsonField('$.msg_content', "= 'text'")} AS msg_preview
+         substr(${jsonField('$.msg_content', "= 'text'")}, 1, ${USER_PREVIEW_CHARS}) AS msg_preview
     FROM local_runtime_message_rows
    WHERE id > ?
    ORDER BY id`;
@@ -62,6 +67,7 @@ function createStore() {
     everScanned: false,
   };
 }
+
 
 export function getFactsStore(dataDir) {
   const key = path.join(dataDir, 'v2', 'sqlite', 'runtime-state.sqlite');
@@ -81,7 +87,8 @@ function applyRow(store, row) {
     entry = {
       sessionId: row.session_id,
       maxTs: null,
-      calls: new Map(), // rowid -> call fact (assistant messages)
+      calls: new Map(), // rowid -> call fact (assistant messages that carry a usage block)
+      assistantCount: 0, // every assistant row, including the ones that are not model calls
       users: new Map(), // rowid -> user message fact
     };
     store.byTurn.set(turnId, entry);
@@ -90,12 +97,21 @@ function applyRow(store, row) {
     entry.maxTs = row.created_at_ms;
   }
   if (row.role === 'assistant') {
-    entry.calls.set(row.id, {
-      ts: row.created_at_ms,
-      decodeMs: row.decode_ms,
-      requestMs: row.request_ms,
-      finishReason: row.finish_reason,
-    });
+    entry.assistantCount += 1;
+    // Only an assistant message that carries a usage block is a MODEL CALL.
+    // The runtime also writes assistant rows for non-call events — context
+    // compaction, for instance (490 of 17,214 such rows on this machine).
+    // Counting those as calls shifts every later pairing in the turn by one,
+    // which made a whole turn report the previous call's decode duration and
+    // rate. They are counted for "did the agent answer?" but never paired.
+    if (row.has_usage) {
+      entry.calls.set(row.id, {
+        ts: row.created_at_ms,
+        decodeMs: row.decode_ms,
+        requestMs: row.request_ms,
+        finishReason: row.finish_reason,
+      });
+    }
   } else if (row.role === 'user') {
     entry.users.set(row.id, { ts: row.created_at_ms, preview: row.msg_preview });
   }
@@ -127,9 +143,11 @@ export function syncFacts(store, db, options = {}) {
   return { rows, full, watermark: store.watermark, turns: store.byTurn.size };
 }
 
-// Assistant messages of a turn, oldest first — the same order the original
-// query produced (ORDER BY created_at_ms), with the rowid as a stable
-// tie-breaker.
+// Model calls of a turn, oldest first — the same order the original query
+// produced (ORDER BY created_at_ms), with the rowid as a stable tie-breaker.
+// Only messages that carry a usage block are returned: those are the calls
+// the runtime recorded in local_runtime_token_usage, and they are what the
+// per-call ledger pairs against.
 export function assistantCallsForTurn(store, turnId) {
   const entry = store.byTurn.get(turnId);
   if (!entry || entry.calls.size === 0) return null;
@@ -141,11 +159,11 @@ export function assistantCallsForTurn(store, turnId) {
 //
 // A turn is exactly one user message followed by however many model calls the
 // agent needed before answering, so it is the natural unit for "one thing the
-// user asked" — and unlike the SessionEnd archive it is readable from the
-// database the instant the first usage row of that turn lands, with no hook and
-// no waiting for the session to close. Verified on this machine: 26 turns today,
-// 24 carrying exactly one user message, 0 carrying more than one, and all 26
-// ending on an assistant message.
+// user asked" — and it is readable from the database the instant the first
+// usage row of that turn lands, with no hook and no waiting for the session
+// to close. Verified on this machine: 26 turns today, 24 carrying exactly one
+// user message, 0 carrying more than one, and all 26 ending on an assistant
+// message.
 export function turnMetaForTurn(store, turnId) {
   const entry = store.byTurn.get(turnId);
   if (!entry) return null;
@@ -158,7 +176,10 @@ export function turnMetaForTurn(store, turnId) {
       userPreview = u.preview != null ? u.preview : userPreview;
     }
   }
-  // The finish reason of the last assistant message that carries one.
+  // The finish reason of the last MODEL CALL that carries one. Non-call
+  // assistant rows (compaction) are deliberately excluded: they carry a
+  // finish_reason of their own, and reading it would report a still-running
+  // turn as "completed".
   const calls = assistantCallsForTurn(store, turnId);
   let finishReason = null;
   if (calls) {
@@ -174,7 +195,7 @@ export function turnMetaForTurn(store, turnId) {
     userPreview,
     lastTs: entry.maxTs,
     finishReason,
-    assistantCount: entry.calls.size,
+    assistantCount: entry.assistantCount,
   };
 }
 

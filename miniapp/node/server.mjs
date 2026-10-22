@@ -7,7 +7,7 @@ import http from 'node:http';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { resolveDataDir, openDb, factsStore } from './lib/common.mjs';
+import { resolveDataDir, openDb, factsStore, factsStats } from './lib/common.mjs';
 import { resolveTrendWindow, buildTrendResult } from './lib/trend.mjs';
 import { querySummary, querySessions, queryDaily, queryWindow, queryCalls, queryTurns } from './lib/queries.mjs';
 
@@ -48,8 +48,11 @@ export async function start(context) {
   // null = untried, false = in-process works, true = must use child fallback.
   let childMode = null;
 
+  // NOTE the spread order: `...p` first, `dataDir` last. The data directory is
+  // resolved by the Host and must never be overridable by a request, so it is
+  // applied AFTER the caller-supplied parameters on purpose.
   const MODES = {
-    window: (p) => queryWindow({ dataDir, ...p }),
+    window: (p) => queryWindow({ ...p, dataDir }),
     trend: (p) => {
       const now = Date.now();
       const { startMs, endMs } = resolveTrendWindow(
@@ -58,11 +61,11 @@ export async function start(context) {
       );
       return buildTrendResult({ dataDir, startMs, endMs, bucket: p.bucket, fillEmpty: p.fillEmpty, now });
     },
-    summary: (p) => querySummary({ dataDir, ...p }),
-    sessions: (p) => querySessions({ dataDir, ...p }),
-    daily: (p) => queryDaily({ dataDir, ...p }),
-    calls: (p) => queryCalls({ dataDir, ...p }),
-    turns: (p) => queryTurns({ dataDir, ...p }),
+    summary: (p) => querySummary({ ...p, dataDir }),
+    sessions: (p) => querySessions({ ...p, dataDir }),
+    daily: (p) => queryDaily({ ...p, dataDir }),
+    calls: (p) => queryCalls({ ...p, dataDir }),
+    turns: (p) => queryTurns({ ...p, dataDir }),
   };
 
   function runChild(mode, params) {
@@ -170,12 +173,7 @@ export async function start(context) {
       dataDir,
       dbExists,
       usageRows,
-      facts: {
-        turns: store.byTurn.size,
-        extractedRows: store.extractedRows,
-        watermark: store.watermark,
-        lastSyncAt: store.lastSyncAt || null,
-      },
+      facts: factsStats(store),
     };
   }
 
@@ -194,6 +192,21 @@ export async function start(context) {
     '/api/daily': 'daily',
     '/api/calls': 'calls',
     '/api/turns': 'turns',
+  };
+
+  // Query parameters are an ALLOW-LIST, not a pass-through. Anything the page
+  // does not send is dropped here, so a crafted query string can never reach
+  // the query layer with a key it does not expect — most importantly it can
+  // never carry a `dataDir` (the database location) or any other internal
+  // option into the query functions.
+  const API_PARAMS = {
+    window: ['startAt', 'endAt', 'days', 'bucket', 'fillEmpty'],
+    trend: ['startAt', 'endAt', 'days', 'bucket', 'fillEmpty'],
+    summary: ['startAt', 'endAt', 'days'],
+    sessions: ['startAt', 'endAt', 'days', 'limit'],
+    daily: ['days'],
+    calls: ['startAt', 'endAt', 'days', 'limit'],
+    turns: ['startAt', 'endAt', 'days', 'limit'],
   };
 
   const server = http.createServer((request, response) => {
@@ -225,8 +238,12 @@ export async function start(context) {
         }
         const mode = API_ROUTES[url.pathname];
         if (mode) {
+          const allowed = API_PARAMS[mode] || [];
           const params = {};
-          for (const [k, v] of url.searchParams) params[k] = v;
+          for (const key of allowed) {
+            if (!url.searchParams.has(key)) continue;
+            params[key] = url.searchParams.get(key);
+          }
           if (params.fillEmpty != null) params.fillEmpty = params.fillEmpty !== 'false';
           try {
             const result = await runQuery(mode, params);

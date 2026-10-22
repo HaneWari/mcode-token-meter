@@ -25,17 +25,17 @@ function run(mode, params) {
       });
     }
     case 'window':
-      return queryWindow({ dataDir, ...params }, now);
+      return queryWindow({ ...params, dataDir }, now);
     case 'summary':
-      return querySummary({ dataDir, ...params }, now);
+      return querySummary({ ...params, dataDir }, now);
     case 'sessions':
-      return querySessions({ dataDir, ...params }, now);
+      return querySessions({ ...params, dataDir }, now);
     case 'daily':
-      return queryDaily({ dataDir, ...params }, now);
+      return queryDaily({ ...params, dataDir }, now);
     case 'calls':
-      return queryCalls({ dataDir, ...params }, now);
+      return queryCalls({ ...params, dataDir }, now);
     case 'turns':
-      return queryTurns({ dataDir, ...params }, now);
+      return queryTurns({ ...params, dataDir }, now);
     default:
       throw new Error(`unknown mode: ${mode}`);
   }

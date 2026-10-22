@@ -17,7 +17,7 @@ import {
   syncMessageFacts,
   meanCallRate,
   rateStats,
-  decodeRateStats,
+  requestRateStats,
   countRatedCalls,
 } from './common.mjs';
 
@@ -197,7 +197,7 @@ export function buildTrendFromContext(ctx, { startMs, endMs, bucket: requestedBu
   finalize(kpi);
   kpi.outputRate = meanCallRate(ledger);
   kpi.rate = rateStats(ledger);
-  kpi.decodeRate = decodeRateStats(ledger);
+  kpi.requestRate = requestRateStats(ledger);
   kpi.rateMeasured = countRatedCalls(ledger);
 
   return {

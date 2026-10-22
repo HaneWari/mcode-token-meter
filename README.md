@@ -4,7 +4,7 @@ English | [简体中文](README.zh-CN.md)
 
 A near-real-time token-usage dashboard for MiniMax Code, running entirely on your own machine. It reads the runtime's own per-call ledger and observability logs, so the numbers it shows are the ones the client actually recorded — not an estimate reconstructed from transcript files.
 
-Author: [HaneWari](https://github.com/HaneWari) · Version: `1.8.0` · License: [Apache-2.0](LICENSE)
+Author: [HaneWari](https://github.com/HaneWari) · Version: `1.9.0` · License: [Apache-2.0](LICENSE)
 
 ![Token Meter Board, synthetic data](docs/preview.png)
 
@@ -21,15 +21,33 @@ Author: [HaneWari](https://github.com/HaneWari) · Version: `1.8.0` · License: 
 
 ## Why this one
 
-Most token boards in this ecosystem answer "how much did I spend". This one also answers "where did it go, and is the number I am looking at the number the client shows?".
+Most token boards answer "how much did I spend". This one also answers "where did it go, and is the number I am looking at the number the client shows?".
 
-- **It reads the ledger, not the transcripts.** Numbers come from the runtime's own per-call usage table plus the observability logs, not from reconstructing usage out of session transcript files. A transcript file carries one aggregate usage block per assistant message and no timing information at all, so any board that reads it silently drops a large and day-dependent share of the real calls (measured on a reference machine: between 24% and 63% of calls, and up to 83% of cache-read tokens, depending on the day).
-- **The output speed matches the client.** Output speed is `Σ output tokens ÷ Σ decode duration` — the decode phase only, from the first token to the end of the stream — which is the same basis the MiniMax Code interface uses. The whole-request speed is shown next to it as a comparison column, so you can see how much of each call was spent waiting for the first token. A speed computed over the whole request instead reports a number roughly 2.4× lower and does not line up with the interface.
+- **It reads the ledger, not the transcripts.** Numbers come from the runtime's own per-call usage table plus the observability logs, not from reconstructing usage out of session transcript files. A transcript file carries one aggregate usage block per assistant message and no timing information at all, so a board that reads it cannot see the calls that are missing from the transcripts — and it can never show a per-call speed, because the transcript has no timings. Measured on a reference machine against a transcript-based board, that board reported about **48% fewer calls and 66% fewer cache-read tokens** overall, and the gap swung between **0% and 98% from day to day**. The cause is not a per-message aggregation rule: some sessions leave no transcript file at all, and a transcript-based board simply cannot see them.
+- **The output speed matches the client.** Output speed is `Σ output tokens ÷ Σ decode duration` — the decode phase only, from the first token to the end of the stream — which is the same basis the MiniMax Code interface uses. The whole-request speed is shown next to it as a comparison column, so you can see how much of each call was spent waiting for the first token. A speed computed over the whole request instead reports a number roughly **1.6–2.1× lower** and does not line up with the interface.
+- **Every call is matched to its own timings.** The board pairs each usage row with the assistant message that carries that call's decode and request durations. It does not match by nearest timestamp and it does not match by position: both go wrong as soon as one turn contains an assistant row that is not a model call (context compaction writes one), which shifts the whole turn. The pairing rule used here was verified against a token-signature ground truth over 16,723 calls with **zero** mismatches.
 - **Totals add up to five terms.** `total = input + output + reasoning + cacheRead + cacheWrite`. Boards that stop at three terms silently drop cache writes and reasoning tokens.
 - **Turn-level granularity.** One question becomes one row, with the call count and the tokens that question actually cost. Nothing has to be closed or archived first.
-- **No Python, no extra process, no dependency.** Pure Node, zero third-party runtime code except a vendored copy of Chart.js. Another board in this ecosystem requires Python 3.8+ and spawns a Python process per query.
-- **Milliseconds, not seconds.** After the caching rework in v1.7.0 a full page refresh went from ~8.5 s to ~30 ms, and switching to a 7-day window takes ~50 ms on a reference machine with a 1.7 M-row message table.
+- **No Python, no extra process, no dependency.** Pure Node, no third-party runtime code except a vendored copy of Chart.js. Another board in this ecosystem requires Python 3.8+ and spawns a Python process per query.
+- **Milliseconds, not seconds.** After the caching rework in v1.7.0 a full page refresh went from ~8.5 s to tens of milliseconds. On a reference machine with a ~17,000-row message table, a full page refresh takes ~50 ms, switching to a 7-day window ~40 ms, and the first query in a fresh process ~1.3 s (it has to scan the message table once).
 - **Strictly read-only.** The Mini App writes nothing, sends nothing, and has no telemetry. No account, no API key, no configuration.
+
+## How this compares with the other token boards
+
+The Mini App gallery already lists two token boards. They are good at what they do, and they solve a slightly different problem:
+
+| | Token Meter Board (this one) | `mcode-token-usage-board` | `mcode-usage-monitor` |
+| --- | --- | --- | --- |
+| Source of truth | Runtime usage table + observability logs | Session transcript files (`messages.jsonl`) | Runtime database, read through Python 3.8+ |
+| Per-call timings | Yes — decode, request, status code per call | No — transcripts carry no timings | Partly — per-request speed |
+| Per-call ledger | Yes, 12 columns | No | Recent requests |
+| Conversation (turn) table with your own words | Yes | No | No |
+| Needs Python | No | No | Yes |
+| Extra process per query | No | No | Yes |
+| Auto refresh | 5 s | 60 s | 5 s / 10 s / 30 s |
+| Layout | Fixed, dense | Fixed | Draggable, user-editable card layout |
+
+The practical difference: if you want to know **where the tokens went in a specific conversation**, or to audit **one specific call** (its decode duration, its request duration, its HTTP status), only this board shows it — and it can do so without re-deriving anything from transcript files. If you prefer a freely rearrangeable card layout, `mcode-usage-monitor` is the one to look at.
 
 ## Install
 
@@ -73,11 +91,19 @@ The board also offers **让 Agent 分析此窗口** (let the Agent analyse this 
 
 The location is resolved from the Host-provided `context.dataDir` (the active MiniMax Code data directory), falling back to `~/.minimax`. **These paths and the column layout of the runtime database are not a published API** — they are the client's internal storage, so a future client release may change them. When that happens the board shows an explicit error instead of an empty dashboard.
 
-**Nothing is written.** No files are created or modified, no data leaves the machine, and there is no telemetry. The only cache lives in the process memory of the running Mini App. The page does display real session titles and model names, so mind your screenshots when sharing them.
+**What the page displays.** The dashboard renders real local data, which means a screenshot of it can contain:
 
-**Network:** none. The Mini App serves one page on `127.0.0.1` and answers its own API routes. It never contacts a remote host, and it makes no request other than to its own origin.
+- **Your own message text** — the conversation table shows the first **200 characters** of each turn's user message. The full text is never loaded: it is truncated inside the database query, so it never enters the app's memory and never reaches the browser.
+- **Session titles and session ids**, and the **absolute workspace path** of each session (shown in the session ranking's tooltip).
+- **Model and provider names**, including the names of your own custom (BYOK) providers.
 
-**Subprocess:** normally none. If the host's Node runtime does not expose `node:sqlite`, the Mini App re-runs the identical read-only queries in a child process: it spawns its own executable with `ELECTRON_RUN_AS_NODE=1`, falling back to `node` on `PATH`, and passes the query mode and parameters as an argv array — never through a shell. The child prints one JSON document on stdout and exits.
+Everything stays on the machine and on the page. If you plan to share a screenshot, remember that your own questions and your local folder names are in it.
+
+**Nothing is written.** No files are created or modified, no data leaves the machine, and there is no telemetry. The only cache lives in the process memory of the running Mini App. The page stores exactly one thing in your browser's `localStorage`: the theme choice, under the key `tmb-theme`. Nothing else is persisted.
+
+**Network:** none. The Mini App serves one page on `127.0.0.1` and answers its own API routes. It never contacts a remote host, and it makes no request other than to its own origin. The query parameters it accepts are an explicit allow-list per endpoint — anything else, including anything that looks like a data-directory override, is dropped before the query runs.
+
+**Subprocess:** normally none. If the host's Node runtime does not expose `node:sqlite`, the Mini App re-runs the identical read-only queries in a child process. It first tries `node` from `PATH`, and only if that executable does not exist does it fall back to the runtime's own executable launched with `ELECTRON_RUN_AS_NODE=1`. The query mode and parameters are passed as an argv array — never through a shell — and the child prints one JSON document on stdout and exits.
 
 **Node.js:** the in-process path needs `node:sqlite`, which is unflagged from Node.js 23.4. The bundled runtime used for testing is Node.js v24.18.0. If neither the in-process runtime nor the child process has it, the board reports the requirement instead of failing silently.
 
@@ -93,6 +119,8 @@ The location is resolved from the Host-provided `context.dataDir` (the active Mi
 
 Calls whose decode duration exceeds the request duration are excluded from the speed aggregate (that combination means the first token arrived before the request was sent — a timestamp artefact that would otherwise inflate the denominator). They are still listed individually in the ledger. A turn that is still in flight is marked unfinished and its rate is computed from what has arrived so far.
 
+The client interface shows its own figure over its own live session. The board uses the same formula on a window you choose, so once the windows are not identical the two can differ by a fraction of a percent (0.3%–3.0% measured on a reference machine).
+
 ## Tested environment
 
 - MiniMax Code Desktop **3.1.4** (build 186), Windows 11 (10.0.22631, x64)
@@ -100,22 +128,26 @@ Calls whose decode duration exceeds the request duration are excluded from the s
 - Verified in the desktop client: plugin install, window switching, custom start/end windows, per-call ledger, live turn growth, auto refresh, light and dark themes, and the error path when the runtime database is missing.
 - macOS and Linux are **not** verified. Nothing in the code is platform-specific — the data paths are resolved from `context.dataDir` — but treat the other platforms as untested.
 
+The full validation record for this release — package checker result, the per-call pairing regression numbers, the injection test, and a same-machine performance A/B — is in [`docs/validation.md`](docs/validation.md).
+
 ## Limitations
 
 - This is a **local observation tool**, not an invoice. Billing and quota are the product's own "usage" page, which is computed server-side and may catch up later.
 - Numbers cover what the client recorded locally. Usage on another machine, or usage from a client that was never running locally, is not visible here.
 - The runtime database and the observability log format are internal to the client and can change without notice.
+- The client writes one aggregate usage block per assistant message into its transcript files, but the per-call usage table is the authoritative record used here. If the runtime ever stops writing a usage row for a call, that call cannot be shown.
 
 ## Third-party components
 
-- [Chart.js](https://www.chartjs.org/) v4.4.3 — vendored at `miniapp/client/vendor/chart.umd.min.js` for offline use. MIT License, © Chart.js Contributors.
+- [Chart.js](https://www.chartjs.org/) v4.4.3 — vendored at `miniapp/client/vendor/chart.umd.min.js` for offline use. MIT License, © Chart.js Contributors. The full licence text ships with the package at `miniapp/client/vendor/LICENSE-chartjs.txt`.
 
 ## Source layout
 
 ```text
 miniapp/
   client/index.html              The whole page: markup, styles, and the client script
-  client/vendor/                Chart.js (MIT), vendored for offline use
+  client/vendor/                 Chart.js (MIT), vendored for offline use
+  client/vendor/LICENSE-chartjs.txt  Full MIT licence text for the vendored copy
   node/server.mjs                HTTP server, routing, and the subprocess fallback
   node/lib/common.mjs            Data-dir resolution, config catalog, log enrichment, metrics
   node/lib/facts.mjs             Incremental message-fact cache (SQL-side JSON extraction)
@@ -128,4 +160,4 @@ No build step is required: the page and the Node service are used as they are.
 
 ## License
 
-[Apache-2.0](LICENSE) — see the file for the full text.
+[Apache-2.0](LICENSE) — see the file for the full text. The vendored Chart.js copy keeps its own MIT licence, reproduced in `miniapp/client/vendor/LICENSE-chartjs.txt`.

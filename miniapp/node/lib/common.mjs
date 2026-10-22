@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { createRequire } from 'node:module';
-import { getFactsStore, syncFacts, assistantCallsForTurn, turnMetaForTurn } from './facts.mjs';
+import { getFactsStore, syncFacts, assistantCallsForTurn, turnMetaForTurn, factsStats } from './facts.mjs';
 
 export const SQLITE_REQUIREMENT =
   'token-meter requires Node.js 23.4+ (24 LTS recommended) so that the built-in node:sqlite module is available without flags.';
@@ -63,6 +63,9 @@ export function openDb(dataDir) {
 export function factsStore(dataDir) {
   return getFactsStore(dataDir);
 }
+
+// Snapshot of the message-fact cache, for the health endpoint.
+export { factsStats };
 
 // Query raw usage rows in [startMs, endMs] ascending by ts.
 export function queryUsageRows(db, startMs, endMs) {
@@ -434,11 +437,21 @@ export function sortGroups(groups) {
 // start → stream end) and usage.decode_duration_ms (first token → stream end) —
 // plus finish_reason. Log lines additionally carry response_status.
 //
-// Pairing: within a turn the two sequences are strictly interleaved —
-// usage row[i].ts equals message[i-1].created_at_ms exactly, i.e. a usage row
-// is stamped when its call STARTS and the matching assistant message is written
-// when that call ENDS. So row[i] pairs with message[i] by index, never by
-// nearest timestamp (nearest-neighbour shifts by one and inflates the rate).
+// Pairing: inside a turn the runtime writes two records per call — the usage
+// row is stamped when the call STARTS, and the matching assistant message is
+// written when that call ENDS. So the message that belongs to a call that
+// started at T is the FIRST message of that turn written at or after T: every
+// earlier message of the turn was written before this call started.
+//
+// That rule replaces the old "the i-th message pairs with the i-th usage row",
+// because the message sequence also holds rows that are not model calls at
+// all — context compaction writes an assistant row with no usage block (490
+// of the 17,214 assistant messages on this machine). Counting those as calls
+// shifted a whole turn by one, so 22.5% of the calls reported the PREVIOUS
+// call's decode duration and rate. With the "first message at or after the
+// call start" rule all 16,723 measurable calls pair correctly (0 errors), and
+// it stays correct when the query window starts in the middle of a turn.
+//
 // There is deliberately no upper bound on how long a single call may take —
 // see the interleaving invariant in buildCallLedger.
 
@@ -470,11 +483,11 @@ export function loadAssistantCallDetails(rows, store) {
 //
 // A turn is exactly one user message followed by however many model calls the
 // agent needed before answering, so it is the natural unit for "one thing the
-// user asked" — and unlike the SessionEnd archive it is readable from the
-// database the instant the first usage row of that turn lands, with no hook and
-// no waiting for the session to close. Verified on this machine: 26 turns today,
-// 24 carrying exactly one user message, 0 carrying more than one, and all 26
-// ending on an assistant message.
+// user asked" — and it is readable from the database the instant the first
+// usage row of that turn lands, with no hook and no waiting for the session
+// to close. Verified on this machine: 26 turns today, 24 carrying exactly one
+// user message, 0 carrying more than one, and all 26 ending on an assistant
+// message.
 export function loadTurnMessageMeta(rows, store) {
   const meta = new Map(); // turn_id -> {userTs, userPreview, lastTs, finishReason, assistantCount}
   for (const r of rows) {
@@ -485,25 +498,16 @@ export function loadTurnMessageMeta(rows, store) {
   return meta;
 }
 
-function nearestByTime(list, ts, tolerance) {
-  // list is sorted by ts; linear scan with an early exit is fine (per-turn lists are short)
-  let best = null;
-  let bestDelta = Infinity;
-  for (const item of list) {
-    if (item.ts == null) continue;
-    const delta = Math.abs(item.ts - ts);
-    if (delta < bestDelta) {
-      best = item;
-      bestDelta = delta;
-    }
-    if (item.ts > ts && item.ts - ts > bestDelta) break;
-  }
-  return bestDelta <= tolerance ? best : null;
-}
-
 // Build one ledger entry per usage row, ordered by ts.
-// Message pairing is by index inside the turn (see loadAssistantCallDetails);
-// only log status lines are matched by time. rate = output_tokens / decode_duration.
+//
+// Pairing (see the header comment for the full invariant):
+//   - the assistant message is the first message of the turn written at or
+//     after the call started;
+//   - the log line is the first llm_response_identifiers record of the turn
+//     written at or after the call started, and not after the next call of
+//     the same turn started.
+//
+// rate = output_tokens / decode_duration.
 //
 // Validity is the interleaving invariant, not an absolute duration limit: a call
 // cannot finish before it starts, and cannot finish after the *next* call in the
@@ -511,36 +515,55 @@ function nearestByTime(list, ts, tolerance) {
 // calls (a 9-minute run) and push the pairing back onto nearest-neighbour matching,
 // which shifts every following row by one — so there is deliberately no upper
 // bound on how long a single call may take.
-const CLOCK_SKEW_MS = 2000;
 
 export function buildCallLedger(rows, enrichment, assistantByTurn, catalog) {
   const ledger = [];
-  const cursor = new Map(); // turn key -> next assistant message index
+  const msgCursor = new Map(); // turn key -> next assistant message index
+  const logCursor = new Map(); // turn key -> next log record index
   for (let i = 0; i < rows.length; i += 1) {
     const row = rows[i];
     const id = resolveRowIdentity(row, enrichment, catalog);
     const key = `${row.session_id}|${row.turn_id}`;
-    // index pairing: row[i] <-> message[i]
+    const next = rows[i + 1];
+    // The next call of the SAME turn bounds the interval this call owns.
+    const boundTs = next && next.turn_id === row.turn_id ? next.ts : null;
+
+    // --- assistant message (decode / request timing, finish reason) ---
     let msg = null;
     const list = row.turn_id ? assistantByTurn.get(key) : null;
     if (list && list.length) {
-      const start = cursor.get(key) || 0;
-      const next = rows[i + 1];
-      const boundTs = next && next.turn_id === row.turn_id ? next.ts : null;
-      for (let j = start; j < list.length; j += 1) {
+      const from = msgCursor.get(key) || 0;
+      for (let j = from; j < list.length; j += 1) {
         const c = list[j];
-        // ended before it started — belongs to an earlier call
-        if (c.ts < row.ts - CLOCK_SKEW_MS) continue;
-        // ended after the next call began — belongs to a later call, keep it for that row
-        if (boundTs != null && c.ts > boundTs + CLOCK_SKEW_MS) continue;
+        // written before this call started — belongs to an earlier call
+        if (c.ts == null || c.ts < row.ts) continue;
         msg = c;
-        cursor.set(key, j + 1);
+        msgCursor.set(key, j + 1);
         break;
       }
     }
+
+    // --- log line (response status) ---
+    // The runtime writes the llm_response_identifiers line a moment AFTER the
+    // usage row is stamped (measured: +443 ms … +194 s, median +2.6 s), so a
+    // nearest-time match walks BACKWARDS and lands on the PREVIOUS call's
+    // line: of 2220 measured mismatches, every single one was off by one in
+    // that direction. The matching record is the first one at or after this
+    // call's start.
+    let statusHit = null;
     const enrichEntry = row.turn_id ? enrichment.get(row.turn_id) : null;
-    // status lines are only used to exclude failures; pick any within tolerance
-    const statusHit = enrichEntry ? nearestByTime(enrichEntry.calls, row.ts, 3 * 60 * 1000) : null;
+    if (enrichEntry && enrichEntry.calls.length) {
+      const from = logCursor.get(key) || 0;
+      for (let j = from; j < enrichEntry.calls.length; j += 1) {
+        const c = enrichEntry.calls[j];
+        if (c.ts == null || c.ts < row.ts) continue;
+        // written after the next call of this turn started — that one owns it
+        if (boundTs != null && c.ts > boundTs) break;
+        statusHit = c;
+        logCursor.set(key, j + 1);
+        break;
+      }
+    }
     const status = statusHit ? statusHit.status : null;
     const decodeMs = msg ? msg.decodeMs : null;
     const requestMs = msg ? msg.requestMs : null;
@@ -681,9 +704,4 @@ export function countRatedCalls(calls) {
   let n = 0;
   for (const c of calls) if (typeof c.rate === 'number') n += 1;
   return n;
-}
-
-// Reference whole-request rate summary (shown alongside the headline figure).
-export function decodeRateStats(calls) {
-  return requestRateStats(calls);
 }
