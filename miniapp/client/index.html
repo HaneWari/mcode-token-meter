@@ -90,12 +90,18 @@ select:focus-visible, input:focus-visible {
   outline: 2px solid var(--mcode-accent); outline-offset: 1px;
 }
 
-/* window bar */
+/* window bar
+   两行布局是刻意的：datetime-local 的原生选择器由浏览器画在 top layer，
+   z-index 压不住，而它总是向下弹出。若「应用」按钮排在时间输入框下方（窄窗口
+   时 flex 换行就会这样），选择器会正好盖住它，用户选完时间根本点不到「应用」。
+   所以时间行固定放在最后一行，选择器往下弹只会盖住下方的内容卡片。 */
 .win-bar {
-  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
   background: var(--mcode-surface); border: 1px solid var(--mcode-border); border-radius: 12px;
   padding: 10px 12px; margin-bottom: 16px;
 }
+.win-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.win-row + .win-row { margin-top: 8px; }
+.win-row-presets .btn-primary { margin-left: auto; }
 .win-field { display: flex; align-items: center; gap: 6px; }
 .win-field span { font-size: 12px; color: var(--mcode-text-muted); }
 .win-arrow { font-size: 12px; color: var(--mcode-text-subtle); }
@@ -105,14 +111,14 @@ select:focus-visible, input:focus-visible {
   padding: 5px 8px; font-variant-numeric: tabular-nums;
 }
 .win-bar input[type='datetime-local']:disabled { opacity: .45; cursor: not-allowed; }
-.seg { display: inline-flex; border: 1px solid var(--mcode-border); border-radius: 8px; overflow: hidden; margin-left: auto; }
+.seg { display: inline-flex; border: 1px solid var(--mcode-border); border-radius: 8px; overflow: hidden; }
 .seg button { font-size: 12px; padding: 6px 12px; border: none; background: var(--mcode-surface); color: var(--mcode-text-muted); cursor: pointer; }
 .seg button + button { border-left: 1px solid var(--mcode-border); }
 .seg button:hover { background: var(--mcode-surface-muted); color: var(--mcode-text); }
 .seg button.on { background: var(--mcode-surface-muted); color: var(--mcode-text); font-weight: 500; }
 .autor { display: flex; align-items: center; gap: 5px; font-size: 12px; color: var(--mcode-text-muted); cursor: pointer; user-select: none; }
 .autor input { accent-color: var(--mcode-accent); }
-.err-line { width: 100%; font-size: 12px; color: var(--mcode-danger); display: none; }
+.err-line { width: 100%; font-size: 12px; color: var(--mcode-danger); display: none; margin-top: 8px; }
 
 /* 更新中标记：数据留在屏幕上，只提示正在取新值，不做整块清空 */
 .busy-flag {
@@ -249,15 +255,19 @@ td .sub { display: block; font-size: 11px; color: var(--mcode-text-subtle); }
   </header>
 
   <section class="win-bar" aria-label="趋势时间窗口">
-    <div class="win-field"><span>开始</span><input type="datetime-local" id="win-start" step="60"></div>
-    <div class="win-arrow">→</div>
-    <div class="win-field"><span>结束</span><input type="datetime-local" id="win-end" step="60"></div>
-    <label class="autor" title="选中后结束时间始终跟随当前时刻，选择器不可编辑"><input type="checkbox" id="win-follow" checked>跟随现在</label>
-    <div class="seg" role="group" aria-label="预设窗口">
-      <button data-preset="1h">近 1 小时</button><button data-preset="today">今天</button><button data-preset="7d">近 7 天</button><button data-preset="30d">近 30 天</button>
+    <div class="win-row win-row-presets">
+      <div class="seg" role="group" aria-label="预设窗口">
+        <button data-preset="1h">近 1 小时</button><button data-preset="today">今天</button><button data-preset="7d">近 7 天</button><button data-preset="30d">近 30 天</button>
+      </div>
+      <button class="btn-primary" id="win-apply">应用</button>
+      <span class="busy-flag" id="busy-flag" hidden><span class="dot"></span><span id="busy-text">更新中…</span></span>
     </div>
-    <button class="btn-primary" id="win-apply">应用</button>
-    <span class="busy-flag" id="busy-flag" hidden><span class="dot"></span><span id="busy-text">更新中…</span></span>
+    <div class="win-row win-row-time">
+      <div class="win-field"><span>开始</span><input type="datetime-local" id="win-start" step="60"></div>
+      <div class="win-arrow">→</div>
+      <div class="win-field"><span>结束</span><input type="datetime-local" id="win-end" step="60"></div>
+      <label class="autor" title="选中后结束时间始终跟随当前时刻，选择器不可编辑"><input type="checkbox" id="win-follow" checked>跟随现在</label>
+    </div>
     <div class="err-line" id="win-err" role="alert"></div>
   </section>
 
@@ -1152,11 +1162,21 @@ document.querySelectorAll('.seg button').forEach(function (btn) {
     applyPreset(activePreset);
   });
 });
-$('win-apply').addEventListener('click', function () {
+function applyWindow() {
   activePreset = null;
   document.querySelectorAll('.seg button').forEach(function (b) { b.classList.remove('on'); });
   refreshWindowSections();
   refreshWindowTables();
+}
+$('win-apply').addEventListener('click', applyWindow);
+// Enter in a time field applies the window too — the native picker can cover
+// the 应用 button in edge cases, and this keeps the keyboard path open.
+['win-start', 'win-end'].forEach(function (id) {
+  $(id).addEventListener('keydown', function (e) {
+    if (e.key !== 'Enter') return;
+    e.preventDefault();
+    applyWindow();
+  });
 });
 $('win-follow').addEventListener('change', function () {
   followNow = $('win-follow').checked;
