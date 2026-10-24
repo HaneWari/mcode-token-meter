@@ -36,6 +36,72 @@ token-meter-board: 0 errors, 1 warning
 - **对话明细计数**：`counts`（已完成 / 未收尾 / 进行中）之和等于 `totalTurns`，在 `days=7/limit=50`、`days=30/limit=10`、`days=1/limit=500` 三种组合下均成立（修复前只统计被 `limit` 截断后的部分）。
 - **用户消息预览**：全部 ≤ 200 字（库内原文最长 52262 字），截断在 SQL 内完成，原文不进入应用内存。
 
+## 本地归档（v1.10.0）
+
+### 为什么需要它
+
+客户端里删除会话是**硬删除**。宿主自己的实现（`app.asar` → `SessionArtifactService.deleteSession`）一次做掉这些事：
+
+```js
+const operations = [
+  () => this.owners.queue.deleteSession(sessionId),
+  () => this.owners.files.deleteSession(sessionId),
+  ...(options.preserveUsage ? [] : [() => this.owners.usage.deleteSession(sessionId)]),
+  () => this.owners.messages.deleteSessionData(sessionId),
+  () => this.deleteLegacyHistory(sessionId),
+  () => this.owners.canonicalHistory.delete(sessionId),   // transcript 目录
+  () => this.owners.stream.deleteSession(sessionId),
+];
+```
+
+`this.owners.usage.deleteSession` 执行的正是 `DELETE FROM local_runtime_token_usage WHERE session_id = ?`；`canonicalHistory.delete` 连 transcript 目录一起删。`preserveUsage` 只给 Peek Session 用，普通删除一律清空。**因此删掉会话后没有任何只读数据源可以恢复它**——这是看板必须自己留一份副本的根本原因。
+
+### 端到端验证
+
+用 `VACUUM INTO` 把运行时库快照成一份副本，在副本上按宿主的方式删掉一个会话，再让看板对着副本跑：
+
+```text
+[1] 删除前：30 天窗口内 13,699 次调用 / 2,206,784,718 tokens
+    目标会话 mvs_2c8da9a059234f888f784242dd971023（2047 次调用 / 440,714,437 tokens）
+[2] 按宿主方式删除：usage=2047  messageRows=2179  session=1
+[3] 删除后：13,699 次调用 / 2,206,784,718 tokens（与删除前完全一致）
+    归档状态：calls=13699  sessions=154  deletedSessions=1  turns=457
+```
+
+逐条断言 9/9 通过：
+
+| 断言 | 结果 |
+| --- | --- |
+| 被删会话仍出现在会话排行里 | 通过 |
+| 它的调用次数不变 | 2047 = 2047 |
+| 它的 token 总量不变 | 440,714,437 = 440,714,437 |
+| 它的标题被保留 | 「token-meter」 |
+| 窗口调用总数不变 | 13,699 = 13,699 |
+| 窗口 token 总数不变 | 2,206,784,718 = 2,206,784,718 |
+| 逐次调用台账仍列出它的调用 | 通过 |
+| 对话明细仍列出它的 23 轮 | 通过 |
+| 被删轮次仍显示用户消息原文预览 | 通过 |
+
+### 性能与韧性
+
+同机同法（各端点连续 5 次取中位数、缓存已热），「归档可写」与「归档不可写」两条路径对比：
+
+| 端点 | 归档开 | 归档关 | 差 |
+| --- | --- | --- | --- |
+| `/api/window?days=1` | 6 ms | 3 ms | +3 ms |
+| `/api/window?days=7` | 25 ms | 23 ms | +2 ms |
+| `/api/window?days=30` | 47 ms | 59 ms | −12 ms |
+| `/api/calls?days=1` | 3 ms | 2 ms | +1 ms |
+| `/api/turns?days=1` | 3 ms | 2 ms | +1 ms |
+| `/api/sessions?days=30` | 17 ms | 17 ms | 0 ms |
+| `/api/daily?days=7` | 11 ms | 13 ms | −2 ms |
+
+归档带来的额外开销在噪声量级（±3 ms）。
+
+- **首次同步**（归档为空时）会做一次全量 pass：13,699 次调用 + 全部 98 个观测日志文件，冷启动首请求 **1,310 ms**；此后每次进程启动的首请求 **107 ms**。
+- 归档文件大小：13,699 次调用共 **4.20 MiB**。
+- **归档不可写时**（插件数据目录只读）：`/api/window?days=1` 仍返回 **200**，调用数正常，看板照常工作，只是被删除的会话无法补回。
+
 ## 性能
 
 同机同法 A/B（同一台机器交替运行 v1.8.0 与 v1.9.0，各端点连续 5 次取中位数、缓存已热）：

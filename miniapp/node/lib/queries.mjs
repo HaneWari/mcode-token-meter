@@ -12,12 +12,6 @@
 import fs from 'node:fs';
 import {
   openDb,
-  queryUsageRows,
-  loadCatalog,
-  loadTurnEnrichment,
-  buildLedgerWithDb,
-  loadTurnMessageMeta,
-  syncMessageFacts,
   meanCallRate,
   rateStats,
   requestRateStats,
@@ -29,6 +23,7 @@ import {
   dayKey,
   clampInt,
 } from './common.mjs';
+import { buildLedgerContext } from './ledger.mjs';
 import { resolveTrendWindow, buildTrendFromContext } from './trend.mjs';
 
 export const NOTES = [
@@ -41,6 +36,8 @@ export const NOTES = [
   '对话明细：每行是一次完整对话，即用户发送一条消息后，模型经过若干次调用直至给出最终回答（turn_id 即该单位）；实时读取，无需等待会话结束。状态分为已完成（末条 finish_reason=stop）、未收尾（末条仍为 toolUse 等）与进行中（尚无 assistant 消息）。',
   '对话明细会显示该轮用户消息原文的前 200 字，仅在本机页面内展示，不出网、不落盘。',
   '统计范围限于本机 runtime 数据库当前保留的数据；早于该保留期的历史不会出现在本表中。',
+  '在客户端里删除会话是硬删除：它的用量行、消息行与会话记录文件会一起消失。因此看板在插件自己的数据目录里维护一份本地归档（只写这个目录，不写运行时数据库），被删除会话的用量会从归档补回，并在会话排行里标记为「已删除」。',
+  '本地归档只影响「会话被删除后还能不能看到」这一件事：运行时仍然是对话与调用的唯一事实来源，归档不可写时看板照常工作，只是被删除的会话无法补回。',
 ];
 
 // Open the DB and load the window rows plus the per-call ledger (identity,
@@ -61,19 +58,7 @@ function contextKey(dataDir, startMs, endMs) {
   return `${dataDir}|${startMs}|${endMs}`;
 }
 
-function loadSessionTitles(db) {
-  const titles = new Map();
-  try {
-    for (const r of db.prepare('SELECT session_id, title, agent_name, workspace_dir FROM local_runtime_sessions').all()) {
-      titles.set(r.session_id, r);
-    }
-  } catch {
-    // titles optional
-  }
-  return titles;
-}
-
-export function openContext(dataDir, startMs, endMs, now = Date.now()) {
+export function openContext(dataDir, startMs, endMs, now = Date.now(), pluginDataDir = null) {
   const key = contextKey(dataDir, startMs, endMs);
   const hit = contextCache.get(key);
   if (hit && now - hit.at < CONTEXT_TTL_MS) return hit.ctx;
@@ -85,15 +70,8 @@ export function openContext(dataDir, startMs, endMs, now = Date.now()) {
     throw err;
   }
   try {
-    const rows = queryUsageRows(db, startMs, endMs);
-    const catalog = loadCatalog(dataDir);
-    const { map: enrichment, filesScanned } = loadTurnEnrichment(dataDir, startMs, { now });
-    // Message facts are extracted once per process and reused; this only picks
-    // up rows appended since the last query.
-    const store = syncMessageFacts(db, dataDir, { now });
-    const ledger = buildLedgerWithDb(db, rows, enrichment, catalog, store);
-    const turnMeta = loadTurnMessageMeta(rows, store);
-    const titles = loadSessionTitles(db);
+    const built = buildLedgerContext({ db, dataDir, pluginDataDir, startMs, endMs, now });
+    const { rows, catalog, enrichment, ledger, turnMeta, titles, filesScanned, archive, deletedSessions } = built;
     const meta = {
       dataDir,
       window: {
@@ -108,8 +86,16 @@ export function openContext(dataDir, startMs, endMs, now = Date.now()) {
       logFilesScanned: filesScanned,
       turnsEnriched: enrichment.size,
       generatedAt: new Date(now).toISOString(),
+      archive: {
+        available: archive.available,
+        error: archive.error,
+        restoredCalls: archive.restoredCalls,
+        restoredSessions: archive.restoredSessions,
+        restoredTurns: archive.restoredTurns,
+        stats: archive.stats,
+      },
     };
-    const ctx = { rows, catalog, enrichment, ledger, turnMeta, titles, filesScanned, dataDir, meta };
+    const ctx = { rows, catalog, enrichment, ledger, turnMeta, titles, filesScanned, dataDir, meta, archive, deletedSessions };
     contextCache.set(key, { at: now, ctx });
     if (contextCache.size > 32) {
       const oldest = contextCache.keys().next().value;
@@ -169,26 +155,26 @@ function summaryFromContext(ctx) {
 }
 
 // summary: window (startAt/endAt minute precision, or days) grouped by provider/model.
-export function querySummary({ dataDir, startAt, endAt, days }, now = Date.now()) {
+export function querySummary({ dataDir, pluginDataDir, startAt, endAt, days }, now = Date.now()) {
   const { startMs, endMs } = resolveTrendWindow({ startAt, endAt, days }, now);
-  const ctx = openContext(dataDir, startMs, endMs, now);
+  const ctx = openContext(dataDir, startMs, endMs, now, pluginDataDir);
   return summaryFromContext(ctx);
 }
 
 // window: trend + summary over a single DB/log scan (one enrichment pass).
-export function queryWindow({ dataDir, startAt, endAt, days, bucket, fillEmpty }, now = Date.now()) {
+export function queryWindow({ dataDir, pluginDataDir, startAt, endAt, days, bucket, fillEmpty }, now = Date.now()) {
   const { startMs, endMs } = resolveTrendWindow({ startAt, endAt, days }, now);
-  const ctx = openContext(dataDir, startMs, endMs, now);
+  const ctx = openContext(dataDir, startMs, endMs, now, pluginDataDir);
   const trend = buildTrendFromContext(ctx, { startMs, endMs, bucket, fillEmpty, now });
   const summary = summaryFromContext(ctx);
   return { trend, summary };
 }
 
 // calls: the per-call ledger for the window, newest first (调用日志).
-export function queryCalls({ dataDir, startAt, endAt, days, limit }, now = Date.now()) {
+export function queryCalls({ dataDir, pluginDataDir, startAt, endAt, days, limit }, now = Date.now()) {
   const lim = clampInt(limit, 1, 1000, 200);
   const { startMs, endMs } = resolveTrendWindow({ startAt, endAt, days: days ?? 1 }, now);
-  const ctx = openContext(dataDir, startMs, endMs, now);
+  const ctx = openContext(dataDir, startMs, endMs, now, pluginDataDir);
   const calls = ctx.ledger
     .slice()
     .sort((a, b) => b.ts - a.ts)
@@ -237,10 +223,10 @@ export function queryCalls({ dataDir, startAt, endAt, days, limit }, now = Date.
 // Rate uses the same basis as the KPI (Σoutput ÷ Σdecode); wall-clock span is
 // reported separately as 时长 and is deliberately NOT used as the denominator,
 // otherwise a long conversation with a slow tail would read as a slow model.
-export function queryTurns({ dataDir, startAt, endAt, days, limit }, now = Date.now()) {
+export function queryTurns({ dataDir, pluginDataDir, startAt, endAt, days, limit }, now = Date.now()) {
   const lim = clampInt(limit, 1, 500, 120);
   const { startMs, endMs } = resolveTrendWindow({ startAt, endAt, days: days ?? 1 }, now);
-  const ctx = openContext(dataDir, startMs, endMs, now);
+  const ctx = openContext(dataDir, startMs, endMs, now, pluginDataDir);
   const byTurn = new Map();
   for (const call of ctx.ledger) {
     if (!call.turnId) continue;
@@ -335,10 +321,10 @@ export function queryTurns({ dataDir, startAt, endAt, days, limit }, now = Date.
 
 // sessions: per-session aggregation over the window, newest activity first.
 // outputRate = the session's weighted decode rate (Σ output ÷ Σ decode).
-export function querySessions({ dataDir, startAt, endAt, days, limit }, now = Date.now()) {
+export function querySessions({ dataDir, pluginDataDir, startAt, endAt, days, limit }, now = Date.now()) {
   const lim = clampInt(limit, 1, 50, 10);
   const { startMs, endMs } = resolveTrendWindow({ startAt, endAt, days: days ?? 30 }, now);
-  const ctx = openContext(dataDir, startMs, endMs, now);
+  const ctx = openContext(dataDir, startMs, endMs, now, pluginDataDir);
   const bySession = new Map();
   for (const call of ctx.ledger) {
     if (!bySession.has(call.sessionId)) {
@@ -388,6 +374,10 @@ export function querySessions({ dataDir, startAt, endAt, days, limit }, now = Da
       return {
         sessionId,
         title: info?.title || null,
+        // true when the runtime no longer lists this session: the numbers come
+        // from the board's own archive, because deleting a session in the
+        // client removes its usage rows for good.
+        deleted: ctx.deletedSessions ? ctx.deletedSessions.has(sessionId) : false,
         agentName: s.agentName || info?.agent_name || null,
         workspaceDir: info?.workspace_dir || null,
         firstActivity: new Date(s.firstTs).toISOString(),
@@ -405,10 +395,10 @@ export function querySessions({ dataDir, startAt, endAt, days, limit }, now = Da
 
 // daily: day x model aggregation over the trailing N days.
 // outputRate = the day's weighted decode rate (Σ output ÷ Σ decode).
-export function queryDaily({ dataDir, days }, now = Date.now()) {
+export function queryDaily({ dataDir, pluginDataDir, days }, now = Date.now()) {
   const n = clampInt(days, 1, 90, 7);
   const { startMs, endMs } = resolveTrendWindow({ days: n }, now);
-  const ctx = openContext(dataDir, startMs, endMs, now);
+  const ctx = openContext(dataDir, startMs, endMs, now, pluginDataDir);
   const byDay = new Map();
   for (const call of ctx.ledger) {
     const key = dayKey(call.ts);

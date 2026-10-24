@@ -68,10 +68,14 @@ export function factsStore(dataDir) {
 export { factsStats };
 
 // Query raw usage rows in [startMs, endMs] ascending by ts.
+//
+// The runtime's own row id is carried along (`usage_id`): it is the stable
+// identity of a model call, and the local archive uses it as its primary key
+// so an archived call can be matched against the live one exactly once.
 export function queryUsageRows(db, startMs, endMs) {
   return db
     .prepare(
-      `SELECT session_id, agent_name, turn_id, model, ts,
+      `SELECT id AS usage_id, session_id, agent_name, turn_id, model, ts,
               input_tokens, output_tokens, reasoning_tokens,
               cache_read_tokens, cache_write_tokens, cost_usd
          FROM local_runtime_token_usage
@@ -79,6 +83,23 @@ export function queryUsageRows(db, startMs, endMs) {
         ORDER BY ts`,
     )
     .all(startMs, endMs);
+}
+
+// Raw usage rows newer than a given runtime row id, regardless of time
+// window. The archive walks the whole table this way so that history the user
+// never happened to look at on screen is still preserved before the runtime
+// deletes it.
+export function queryUsageRowsSince(db, minId) {
+  return db
+    .prepare(
+      `SELECT id AS usage_id, session_id, agent_name, turn_id, model, ts,
+              input_tokens, output_tokens, reasoning_tokens,
+              cache_read_tokens, cache_write_tokens, cost_usd
+         FROM local_runtime_token_usage
+        WHERE id > ?
+        ORDER BY id`,
+    )
+    .all(minId);
 }
 
 export function dayKey(ms) {
@@ -354,6 +375,23 @@ export function loadTurnEnrichment(dataDir, windowStartMs, options = {}) {
   return { map, filesScanned };
 }
 
+// Session metadata (title, agent, workspace) for every session the runtime
+// still lists. The local archive keeps a copy of the same rows, so a session
+// that is later deleted still shows its name in the ranking.
+export function loadSessionTitles(db) {
+  const titles = new Map();
+  try {
+    for (const r of db
+      .prepare('SELECT session_id, title, agent_name, workspace_dir, created_at_ms FROM local_runtime_sessions')
+      .all()) {
+      titles.set(r.session_id, r);
+    }
+  } catch {
+    // titles optional
+  }
+  return titles;
+}
+
 // --- row identity + metrics ---------------------------------------------------
 
 export function resolveRowIdentity(row, enrichment, catalog) {
@@ -577,6 +615,7 @@ export function buildCallLedger(rows, enrichment, assistantByTurn, catalog) {
     const requestRate =
       succeeded && requestMs > 0 && output > 0 ? Math.round((output / (requestMs / 1000)) * 100) / 100 : null;
     ledger.push({
+      usageId: row.usage_id ?? null,
       ts: row.ts,
       sessionId: row.session_id,
       agentName: row.agent_name || null,

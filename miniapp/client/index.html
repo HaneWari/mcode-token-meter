@@ -193,6 +193,8 @@ tbody tr:hover { background: var(--mcode-surface-muted); }
 td.name, th.name { white-space: normal; min-width: 140px; max-width: 260px; }
 td.name span { display: block; overflow: hidden; text-overflow: ellipsis; }
 td .sub { display: block; font-size: 11px; color: var(--mcode-text-subtle); }
+/* sessions the client deleted: the numbers survive in the board's own archive */
+td.name .tag.gone { display: inline-block; margin: 3px 0 0 6px; color: var(--mcode-text-subtle); border-color: var(--mcode-text-subtle); }
 .empty-row td { text-align: center; color: var(--mcode-text-subtle); padding: 20px 10px; }
 .sec-err { font-size: 12px; color: var(--mcode-danger); display: none; margin-top: 8px; }
 .hit { color: var(--mcode-success); }
@@ -684,10 +686,12 @@ function rebuildChart(d) {
 function renderTrend(d) {
   trendData = d;
   var bucketName = { minute: '分钟', hour: '小时', day: '天' }[d.window.bucket] || d.window.bucket;
+  var archived = (d.meta.archive && d.meta.archive.restoredCalls) || 0;
   $('top-meta').textContent =
     fmtLocal(d.window.start) + ' → ' + fmtLocal(d.window.end) +
     ' · ' + bucketName + '桶 · ' + fmt.format(d.meta.rows) + ' 条记录 · 更新于 ' +
-    new Date(d.meta.generatedAt).toLocaleTimeString('zh-CN', { hour12: false });
+    new Date(d.meta.generatedAt).toLocaleTimeString('zh-CN', { hour12: false }) +
+    (archived ? ' · 其中 ' + fmt.format(archived) + ' 次调用来自本地归档（会话已被删除）' : '');
   $('kpi-total').textContent = compact(d.kpis.totalTokens);
   $('kpi-total-sub').textContent = fmt.format(d.kpis.totalTokens) + ' tokens';
   $('kpi-calls').textContent = fmt.format(d.kpis.calls);
@@ -820,6 +824,11 @@ function renderSessions(d) {
     title.title = s.sessionId + (s.workspaceDir ? '\n' + s.workspaceDir : '');
     name.appendChild(title);
     if (s.title) name.appendChild(el('span', 'sub', s.sessionId.slice(0, 12) + '…'));
+    if (s.deleted) {
+      var gone = el('span', 'tag gone', '已删除');
+      gone.title = '该会话已被客户端删除。删除会连带删掉它的用量行与记录文件，\n这些数字来自看板自己的本地归档。';
+      name.appendChild(gone);
+    }
     tr.appendChild(name);
     tr.appendChild(el('td', null, s.agentName || '--'));
     tr.appendChild(tdNum(s.calls));

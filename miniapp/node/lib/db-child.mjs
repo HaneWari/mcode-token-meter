@@ -8,6 +8,7 @@ import { querySummary, querySessions, queryDaily, queryWindow, queryCalls, query
 
 function run(mode, params) {
   const dataDir = params?.dataDir || resolveDataDir();
+  const pluginDataDir = params?.pluginDataDir || null;
   const now = Date.now();
   switch (mode) {
     case 'trend': {
@@ -17,6 +18,7 @@ function run(mode, params) {
       );
       return buildTrendResult({
         dataDir,
+        pluginDataDir,
         startMs,
         endMs,
         bucket: params?.bucket,
@@ -25,17 +27,17 @@ function run(mode, params) {
       });
     }
     case 'window':
-      return queryWindow({ ...params, dataDir }, now);
+      return queryWindow({ ...params, dataDir, pluginDataDir }, now);
     case 'summary':
-      return querySummary({ ...params, dataDir }, now);
+      return querySummary({ ...params, dataDir, pluginDataDir }, now);
     case 'sessions':
-      return querySessions({ ...params, dataDir }, now);
+      return querySessions({ ...params, dataDir, pluginDataDir }, now);
     case 'daily':
-      return queryDaily({ ...params, dataDir }, now);
+      return queryDaily({ ...params, dataDir, pluginDataDir }, now);
     case 'calls':
-      return queryCalls({ ...params, dataDir }, now);
+      return queryCalls({ ...params, dataDir, pluginDataDir }, now);
     case 'turns':
-      return queryTurns({ ...params, dataDir }, now);
+      return queryTurns({ ...params, dataDir, pluginDataDir }, now);
     default:
       throw new Error(`unknown mode: ${mode}`);
   }

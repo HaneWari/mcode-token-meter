@@ -6,20 +6,16 @@ import {
   resolveDataDir,
   openDb,
   clampInt,
-  queryUsageRows,
-  loadCatalog,
-  loadTurnEnrichment,
   resolveRowIdentity,
   emptyMetrics,
   addRow,
   finalize,
-  buildLedgerWithDb,
-  syncMessageFacts,
   meanCallRate,
   rateStats,
   requestRateStats,
   countRatedCalls,
 } from './common.mjs';
+import { buildLedgerContext } from './ledger.mjs';
 
 export function parseLocalDateTime(value) {
   const m = String(value || '')
@@ -218,12 +214,21 @@ export function buildTrendFromContext(ctx, { startMs, endMs, bucket: requestedBu
       logFilesScanned: filesScanned,
       turnsEnriched: enrichment.size,
       generatedAt: new Date(now).toISOString(),
+      // What the local archive contributed to this window: calls whose session
+      // the runtime has since deleted.
+      archive: ctx.archive
+        ? {
+            available: ctx.archive.available,
+            restoredCalls: ctx.archive.restoredCalls,
+            restoredSessions: ctx.archive.restoredSessions,
+          }
+        : null,
     },
   };
 }
 
 // Standalone trend query: opens its own context, aggregates, closes.
-export function buildTrendResult({ dataDir, startMs, endMs, bucket, fillEmpty, now = Date.now() }) {
+export function buildTrendResult({ dataDir, pluginDataDir, startMs, endMs, bucket, fillEmpty, now = Date.now() }) {
   const dir = dataDir || resolveDataDir();
   const { db, error } = openDb(dir);
   if (!db) {
@@ -232,15 +237,8 @@ export function buildTrendResult({ dataDir, startMs, endMs, bucket, fillEmpty, n
     throw err;
   }
   try {
-    const rows = queryUsageRows(db, startMs, endMs);
-    const catalog = loadCatalog(dir);
-    const { map: enrichment, filesScanned } = loadTurnEnrichment(dir, startMs, { now });
-    const store = syncMessageFacts(db, dir, { now });
-    const ledger = buildLedgerWithDb(db, rows, enrichment, catalog, store);
-    return buildTrendFromContext(
-      { rows, catalog, enrichment, ledger, dataDir: dir, filesScanned },
-      { startMs, endMs, bucket, fillEmpty, now },
-    );
+    const ctx = buildLedgerContext({ db, dataDir: dir, pluginDataDir, startMs, endMs, now });
+    return buildTrendFromContext(ctx, { startMs, endMs, bucket, fillEmpty, now });
   } finally {
     db.close();
   }

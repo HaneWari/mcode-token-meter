@@ -4,7 +4,7 @@ English | [简体中文](README.zh-CN.md)
 
 A near-real-time token-usage dashboard for MiniMax Code, running entirely on your own machine. It reads the runtime's own per-call ledger and observability logs, so the numbers it shows are the ones the client actually recorded — not an estimate reconstructed from transcript files.
 
-Author: [HaneWari](https://github.com/HaneWari) · Version: `1.9.0` · License: [Apache-2.0](LICENSE)
+Author: [HaneWari](https://github.com/HaneWari) · Version: `1.10.0` · License: [Apache-2.0](LICENSE)
 
 ![Token Meter Board, synthetic data](docs/preview.png)
 
@@ -23,6 +23,7 @@ Author: [HaneWari](https://github.com/HaneWari) · Version: `1.9.0` · License: 
 - **Per-call ledger** — every single model call with its exact timestamp, model, all five token classes, output speed, whole-request speed, decode duration, request duration, and status code.
 - **Time windows** — last hour / today / last 7 days / last 30 days, or any custom start and end. The time bar is laid out in two rows so the native date picker can never cover the *Apply* button, and pressing Enter inside a time field applies the window too.
 - **5-second auto refresh** with a manual refresh button. Switching a window never blanks the tables and never waits: the previous window stays on screen until the new values arrive, and a late response from an older window is discarded rather than overwriting the newer one.
+- **Deleted sessions stay on the board.** Deleting a conversation in the client removes its usage rows, its message rows and its transcript — there is nothing left to read them from. The board keeps its own copy of every call it has seen, in the writable directory the Host provides for the plugin, and serves deleted sessions back from that archive, marked **已删除**. The runtime's own database is never written to.
 
 ## Why this one
 
@@ -35,7 +36,7 @@ Most token boards answer "how much did I spend". This one also answers "where di
 - **Turn-level granularity.** One question becomes one row, with the call count and the tokens that question actually cost. Nothing has to be closed or archived first.
 - **No Python, no extra process, no dependency.** Pure Node, no third-party runtime code except a vendored copy of Chart.js. Another board in this ecosystem requires Python 3.8+ and spawns a Python process per query.
 - **Milliseconds, not seconds.** After the caching rework in v1.7.0 a full page refresh went from ~8.5 s to tens of milliseconds. On a reference machine with a ~17,000-row message table, a full page refresh takes ~50 ms, switching to a 7-day window ~40 ms, and the first query in a fresh process ~1.3 s (it has to scan the message table once).
-- **Strictly read-only.** The Mini App writes nothing, sends nothing, and has no telemetry. No account, no API key, no configuration.
+- **Read-only towards the runtime.** The board never writes to the client's database, its logs or its configuration, sends nothing, and has no telemetry. Its only write is its own archive file, in the plugin's own data directory. No account, no API key, no configuration.
 
 ## How this compares with the other token boards
 
@@ -115,6 +116,8 @@ The board also offers **让 Agent 分析此窗口** (let the Agent analyse this 
 
 > [!IMPORTANT]
 > **This build reads your client's internal storage, not a public API.** It opens the runtime's SQLite database, the observability log files, and `config.yaml` directly. Those paths, their table layout, and their field names are the client's private implementation — they can change in any client update, and when they do this board stops working until someone updates it. The official Mini App package review does not cover this build, because it is not distributed through the official channel; you are the one deciding whether that trade-off is acceptable for you.
+>
+> It also **writes one file of its own** — a local archive of the calls it has seen — because the client deletes a session's usage rows for good. See [What is written](#what-is-written--one-file-in-the-plugins-own-directory) below for exactly what that file is and where it lives.
 
 **Files read (read-only, never modified):**
 
@@ -134,7 +137,19 @@ The location is resolved from the Host-provided `context.dataDir` (the active Mi
 
 Everything stays on the machine and on the page. If you plan to share a screenshot, remember that your own questions and your local folder names are in it.
 
-**Nothing is written.** No files are created or modified, no data leaves the machine, and there is no telemetry. The only cache lives in the process memory of the running Mini App. The page stores exactly one thing in your browser's `localStorage`: the theme choice, under the key `tmb-theme`. Nothing else is persisted.
+**What is written — one file, in the plugin's own directory.** Deleting a session in the client is a *hard* delete: the Host's own `SessionArtifactService.deleteSession` drops that session's usage rows, its message rows and its transcript directory together, so afterwards there is nothing left to read them from. The board therefore keeps a copy of every model call it has seen, in the writable directory the Host provides for the plugin:
+
+```text
+<dataDir>/v2/plugin-data/liveboards/token-meter-board/archive.sqlite
+```
+
+| Written | Where | What it holds |
+| --- | --- | --- |
+| `archive.sqlite` | the plugin's own data directory (Host-provided, removed with the plugin) | one row per model call — tokens, timestamp, session, turn, and the model / decode timing / HTTP status it was displayed with — plus the session titles and the first 200 characters of each user message the board showed |
+
+The runtime's own database, its observability logs and `config.yaml` are only ever **read**. The archive is a copy, not a replacement: every session the runtime still lists is served from the runtime, and archived rows are merged in only for calls the runtime no longer has. If the archive cannot be written (a read-only directory, for instance), the board still works — deleted sessions simply cannot be restored.
+
+Beyond that one file, nothing is persisted: no data leaves the machine, and there is no telemetry. The page stores exactly one thing in your browser's `localStorage`: the theme choice, under the key `tmb-theme`.
 
 **Network:** none. The Mini App serves one page on `127.0.0.1` and answers its own API routes. It never contacts a remote host, and it makes no request other than to its own origin. The query parameters it accepts are an explicit allow-list per endpoint — anything else, including anything that looks like a data-directory override, is dropped before the query runs.
 
@@ -171,6 +186,7 @@ The full validation record for this release — package checker result, the per-
 - Numbers cover what the client recorded locally. Usage on another machine, or usage from a client that was never running locally, is not visible here.
 - The runtime database and the observability log format are internal to the client and can change without notice.
 - The client writes one aggregate usage block per assistant message into its transcript files, but the per-call usage table is the authoritative record used here. If the runtime ever stops writing a usage row for a call, that call cannot be shown.
+- **The archive can only protect what it has already seen.** A session that is deleted before the board has ever run over it is gone for good — the runtime removes it without a trace, and the board was not there to copy it. The first run of the board archives the whole history it can still see, so the window in which history is at risk is the one before you ever open the board.
 
 ## Third-party components
 
@@ -186,6 +202,8 @@ miniapp/
   node/server.mjs                HTTP server, routing, and the subprocess fallback
   node/lib/common.mjs            Data-dir resolution, config catalog, log enrichment, metrics
   node/lib/facts.mjs             Incremental message-fact cache (SQL-side JSON extraction)
+  node/lib/ledger.mjs            One scan of the runtime + the local archive merge
+  node/lib/archive.mjs           The local archive: schema, incremental sync, restore
   node/lib/queries.mjs           Window, summary, session, daily, call, and turn queries
   node/lib/trend.mjs             Window resolution and bucketing
   node/lib/db-child.mjs          Query runner for the subprocess fallback

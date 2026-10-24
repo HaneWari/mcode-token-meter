@@ -8,6 +8,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { resolveDataDir, openDb, factsStore, factsStats } from './lib/common.mjs';
+import { archiveFile as archiveFilePath, openArchive, archiveStats } from './lib/archive.mjs';
 import { resolveTrendWindow, buildTrendResult } from './lib/trend.mjs';
 import { querySummary, querySessions, queryDaily, queryWindow, queryCalls, queryTurns } from './lib/queries.mjs';
 
@@ -44,6 +45,13 @@ function isSqliteUnavailable(err) {
  */
 export async function start(context) {
   const dataDir = resolveAppDataDir(context.dataDir);
+  // The Host hands the Mini App a writable, host-owned directory for the
+  // plugin's own persistent state (that is where the local usage archive
+  // lives). When the injected dataDir IS the runtime data directory — which
+  // happens if the Host ever points straight at it — we do not write into the
+  // runtime's own tree; the archive falls back to the Host's plugin-data path.
+  const injected = context.dataDir ? path.resolve(context.dataDir) : null;
+  const pluginDataDir = injected && injected !== dataDir ? injected : null;
   const children = new Set();
   // null = untried, false = in-process works, true = must use child fallback.
   let childMode = null;
@@ -52,25 +60,25 @@ export async function start(context) {
   // resolved by the Host and must never be overridable by a request, so it is
   // applied AFTER the caller-supplied parameters on purpose.
   const MODES = {
-    window: (p) => queryWindow({ ...p, dataDir }),
+    window: (p) => queryWindow({ ...p, dataDir, pluginDataDir }),
     trend: (p) => {
       const now = Date.now();
       const { startMs, endMs } = resolveTrendWindow(
         { startAt: p.startAt, endAt: p.endAt, days: p.days },
         now,
       );
-      return buildTrendResult({ dataDir, startMs, endMs, bucket: p.bucket, fillEmpty: p.fillEmpty, now });
+      return buildTrendResult({ dataDir, pluginDataDir, startMs, endMs, bucket: p.bucket, fillEmpty: p.fillEmpty, now });
     },
-    summary: (p) => querySummary({ ...p, dataDir }),
-    sessions: (p) => querySessions({ ...p, dataDir }),
-    daily: (p) => queryDaily({ ...p, dataDir }),
-    calls: (p) => queryCalls({ ...p, dataDir }),
-    turns: (p) => queryTurns({ ...p, dataDir }),
+    summary: (p) => querySummary({ ...p, dataDir, pluginDataDir }),
+    sessions: (p) => querySessions({ ...p, dataDir, pluginDataDir }),
+    daily: (p) => queryDaily({ ...p, dataDir, pluginDataDir }),
+    calls: (p) => queryCalls({ ...p, dataDir, pluginDataDir }),
+    turns: (p) => queryTurns({ ...p, dataDir, pluginDataDir }),
   };
 
   function runChild(mode, params) {
     return new Promise((resolve, reject) => {
-      const args = [CHILD_PATH, mode, JSON.stringify({ ...params, dataDir })];
+      const args = [CHILD_PATH, mode, JSON.stringify({ ...params, dataDir, pluginDataDir })];
       const trySpawn = (cmd, env) => {
         const child = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, env });
         children.add(child);
@@ -162,6 +170,19 @@ export async function start(context) {
       }
     }
     const store = factsStore(dataDir);
+    const archiveFile = archiveFilePath(pluginDataDir, dataDir);
+    let archive = { file: archiveFile, exists: fs.existsSync(archiveFile), stats: null };
+    if (archive.exists) {
+      try {
+        const opened = openArchive(pluginDataDir, dataDir);
+        if (opened.db) {
+          archive.stats = archiveStats(opened.db);
+          opened.db.close();
+        }
+      } catch {
+        archive.stats = null;
+      }
+    }
     return {
       ok: true,
       now: Date.now(),
@@ -174,6 +195,7 @@ export async function start(context) {
       dbExists,
       usageRows,
       facts: factsStats(store),
+      archive,
     };
   }
 
