@@ -10,6 +10,11 @@ Author: [HaneWari](https://github.com/HaneWari) · Version: `1.9.0` · License: 
 
 *The preview uses synthetic sessions and usage data. The app interface is currently in Chinese.*
 
+> [!IMPORTANT]
+> **This is an unofficial, community-built project.** It is not built, reviewed, endorsed, or published by MiniMax, and nothing in it has passed the official Mini App review. It is distributed straight from this repository.
+>
+> Read [Data & access](#data--access) before you install it: this build reads your client's **internal storage files** (the runtime SQLite database, the observability logs, and `config.yaml`), and the client may change their layout in any update.
+
 ## What you get
 
 - **Usage trend** — stacked bars per model, with the cache-hit-rate and output-speed curves drawn on top. Buckets adapt from minutes to hours to days as the window grows.
@@ -34,7 +39,7 @@ Most token boards answer "how much did I spend". This one also answers "where di
 
 ## How this compares with the other token boards
 
-The Mini App gallery already lists two token boards. They are good at what they do, and they solve a slightly different problem:
+The MiniMax Code community lists two other token boards. They are good at what they do, and they solve a slightly different problem:
 
 | | Token Meter Board (this one) | `mcode-token-usage-board` | `mcode-usage-monitor` |
 | --- | --- | --- | --- |
@@ -51,7 +56,21 @@ The practical difference: if you want to know **where the tokens went in a speci
 
 ## Install
 
-Copy this entire directory into the MiniMax Code data directory. By default `<dataDir>` is `.minimax` in your home folder (`~/.minimax`), so the default path is:
+> [!WARNING]
+> Mini App code runs on your machine under your own user account, and the Host does not apply an OS-level sandbox. Install only packages whose source you trust — and read [Data & access](#data--access) first, so you know exactly what this one touches.
+
+There are three routes. Pick whichever fits you.
+
+### A. Download the ZIP from Releases and hand it to your Agent
+
+Go to [Releases](https://github.com/HaneWari/mcode-token-meter/releases), download `token-meter-board-v1.9.0.zip`, and unpack it. Then give your MiniMax Code Agent either the unpacked folder **or** the ZIP itself and ask it to publish it as a finished package (*成品包流程*). The Agent copies it into `<dataDir>/plugins/token-meter-board/` for you.
+
+> [!NOTE]
+> The ZIP root contains `.minimax-plugin/plugin.json` directly. Unpack it as it is — do not add another folder level around it.
+
+### B. Copy the directory yourself
+
+Clone or download this repository, then copy the **whole plugin directory** — including the hidden `.minimax-plugin` folder — into:
 
 ```text
 <dataDir>/plugins/token-meter-board/
@@ -63,9 +82,22 @@ Copy this entire directory into the MiniMax Code data directory. By default `<da
 | macOS | `/Users/<you>/.minimax/plugins/token-meter-board` |
 | Linux | `/home/<you>/.minimax/plugins/token-meter-board` |
 
-Keep the hidden `.minimax-plugin` directory — the plugin is recognised by it. If you set a custom data directory (`MINIMAX_DATA_DIR`), use that directory's `plugins/` folder instead.
+`<dataDir>` is the active MiniMax Code data directory — `.minimax` in your home folder by default, or whatever `MINIMAX_DATA_DIR` points at.
 
-Restart MiniMax Code, confirm the plugin is enabled, then open **Token 仪表盘** (Token Meter Board), or just ask the Agent to open it.
+If you cloned this repository, the plugin directory **is the repository root**, so copy the repo root into `plugins/token-meter-board/`. Two mistakes to avoid: ending up with `plugins/token-meter-board/token-meter-board/`, and keeping an extra `plugins/<your-github-name>/` layer in between.
+
+### C. Clone straight into the plugins folder
+
+```bash
+git clone https://github.com/HaneWari/mcode-token-meter.git ~/.minimax/plugins/token-meter-board
+```
+
+### Then
+
+Restart MiniMax Code, confirm the plugin is listed and enabled, then open **Token 仪表盘** (Token Meter Board) — or just ask the Agent to open it.
+
+> [!NOTE]
+> **The desktop client's "import plugin from GitHub" flow does not support Mini App packages.** Every Mini App has to be installed by one of the three routes above.
 
 ## Use it
 
@@ -80,6 +112,9 @@ Example prompts, and what you get back:
 The board also offers **让 Agent 分析此窗口** (let the Agent analyse this window): it appends the current window's totals, call count, cache hit rate and output speed to the chat input so you can ask follow-up questions about the same numbers you were just looking at.
 
 ## Data & access
+
+> [!IMPORTANT]
+> **This build reads your client's internal storage, not a public API.** It opens the runtime's SQLite database, the observability log files, and `config.yaml` directly. Those paths, their table layout, and their field names are the client's private implementation — they can change in any client update, and when they do this board stops working until someone updates it. The official Mini App package review does not cover this build, because it is not distributed through the official channel; you are the one deciding whether that trade-off is acceptable for you.
 
 **Files read (read-only, never modified):**
 

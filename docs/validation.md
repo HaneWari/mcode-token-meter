@@ -1,10 +1,10 @@
 # 验收说明 / Validation notes
 
-本页记录本包提交官方 Mini App 市场前的自检结果，供审阅者复核。所有数字均来自本机实测。
+本页记录本包发布到本公开仓库（`HaneWari/mcode-token-meter`）前的自检结果，供使用者复核。所有数字均来自本机实测。
 
 ## 包检查（官方校验器）
 
-用官方仓 `MiniMax-AI/MiniMax-Code-MiniApps` 的 `scripts/validate.mjs` 直接检查本包目录：
+用官方社区仓 `MiniMax-AI/MiniMax-Code-MiniApps` 的 `scripts/validate.mjs` 直接检查本包目录：
 
 ```text
 token-meter-board: 0 errors, 1 warning

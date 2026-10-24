@@ -10,6 +10,11 @@
 
 *预览中的会话与用量均为合成数据。应用界面为中文。*
 
+> [!IMPORTANT]
+> **这是一个非官方的社区项目。** 它不是 MiniMax 制作、审核、认可或发布的，也没有经过官方 Mini App 评审；它直接由本仓库分发。
+>
+> 安装前请先读[数据与访问](#数据与访问)：本版本会读取客户端的**内部存储文件**（运行时 SQLite 数据库、观测日志、`config.yaml`），而这些结构可能在任何一次客户端更新中改变。
+
 ## 能看到什么
 
 - **用量趋势** —— 按模型堆叠的柱状图，缓存命中率与输出速率两条曲线叠绘在柱状图之上。窗口拉长时分桶自动从分钟级过渡到小时级、天级。
@@ -34,7 +39,7 @@
 
 ## 与另外两款 token 看板的差别
 
-官方 Mini App 目录里已经收录了两款 token 看板，各有所长，解决的也略有不同：
+MiniMax Code 社区里还有另外两款 token 看板，各有所长，解决的也略有不同：
 
 | | Token 仪表盘（本款） | `mcode-token-usage-board` | `mcode-usage-monitor` |
 | --- | --- | --- | --- |
@@ -51,7 +56,21 @@
 
 ## 安装
 
-把整个目录复制到 MiniMax Code 数据目录下。默认 `<dataDir>` 是用户主目录下的 `.minimax`（即 `~/.minimax`），默认路径为：
+> [!WARNING]
+> Mini App 的代码以你的用户身份在本机运行，宿主也没有使用操作系统级沙箱。请只安装来源可信的包——并先读[数据与访问](#数据与访问)，清楚它会碰哪些东西。
+
+有三条路，按需选一条。
+
+### A. 从 Releases 下载 ZIP，交给 Agent
+
+到 [Releases](https://github.com/HaneWari/mcode-token-meter/releases) 下载 `token-meter-board-v1.9.0.zip` 并解压。然后把解压后的目录**或者**那个 ZIP 直接交给 MiniMax Code 的 Agent，让它按**成品包流程**发布，Agent 会替你复制到 `<dataDir>/plugins/token-meter-board/`。
+
+> [!NOTE]
+> ZIP 的根目录直接包含 `.minimax-plugin/plugin.json`。请原样解压，不要在外面再套一层目录。
+
+### B. 手动复制目录
+
+克隆或下载本仓库，然后把**整个插件目录**——包括隐藏的 `.minimax-plugin` 目录——复制到：
 
 ```text
 <dataDir>/plugins/token-meter-board/
@@ -63,9 +82,22 @@
 | macOS | `/Users/<用户名>/.minimax/plugins/token-meter-board` |
 | Linux | `/home/<用户名>/.minimax/plugins/token-meter-board` |
 
-复制时不要漏掉隐藏的 `.minimax-plugin` 目录 —— 插件靠它被识别。若设置了自定义数据目录（`MINIMAX_DATA_DIR`），请放进该目录的 `plugins/` 下。
+`<dataDir>` 是当前 MiniMax Code 数据目录——默认是主目录下的 `.minimax`，或 `MINIMAX_DATA_DIR` 指向的目录。
 
-装完重启 MiniMax Code，确认插件已启用，然后打开 **Token 仪表盘**，或在对话里让 Agent 打开。
+如果你是克隆本仓库拿到的，**仓库根目录本身就是插件目录**，所以要把仓库根目录复制进 `plugins/token-meter-board/`。两个常见错误：复制成 `plugins/token-meter-board/token-meter-board/`，以及中间多留一层 `plugins/<你的 GitHub 用户名>/`。
+
+### C. 直接克隆到插件目录
+
+```bash
+git clone https://github.com/HaneWari/mcode-token-meter.git ~/.minimax/plugins/token-meter-board
+```
+
+### 然后
+
+重启 MiniMax Code，确认插件已出现并处于启用状态，然后打开 **Token 仪表盘**，或在对话里让 Agent 打开。
+
+> [!NOTE]
+> **桌面端的「从 GitHub 导入插件」入口不支持 Mini App 包。** 任何 Mini App 都得用上面三条路之一手动安装。
 
 ## 使用
 
@@ -80,6 +112,9 @@
 看板还带一个 **「让 Agent 分析此窗口」** 按钮：把当前窗口的总量、调用次数、缓存命中率与输出速率填进聊天输入框，你可以对着刚看过的同一份数字继续追问。
 
 ## 数据与访问
+
+> [!IMPORTANT]
+> **本版本读的是客户端的内部存储，不是公开 API。** 它直接打开运行时 SQLite 数据库、观测日志文件与 `config.yaml`。这些路径、表结构与字段名都是客户端的私有实现，可能在任何一次客户端更新中改变；一旦改变，这个看板就会失效，直到有人跟进适配。官方 Mini App 包评审不覆盖本版本，因为它不是走官方渠道分发的——是否接受这个取舍，由你自己判断。
 
 **读取的文件（只读，绝不修改）：**
 
